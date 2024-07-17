@@ -55,4 +55,5 @@ with network:
     Connection(hidden, output, Dense(Normal(mean=0.0, sd=0.03)),
                Exponential(5.0))
 
-export("test.hd5", input, output)
+network.load((NUM_EPOCHS - 1,), serialiser)
+export("test.net", input, output)
