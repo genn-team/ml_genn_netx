@@ -1,7 +1,9 @@
 import h5py
 
-from ml_genn import Network
 from typing import Sequence
+from ml_genn import Network
+from ml_genn.connectivity import Dense
+
 
 from ml_genn.utils.network import get_underlying_pop
 
@@ -46,23 +48,82 @@ def _get_network_dag(inputs, outputs):
 
     # Zip DAG back together with recurrentness 
     return list(zip(dag, recurrent))
+
+def _export_feedfoward(layer_group, pop):
+    # Check there's only one incoming connection
+    if len(pop.incoming_connections) != 1:
+        raise NotImplementedError("mlGeNN NetX exporter does not currently "
+                                  "support architectures requiring "
+                                  "'concatenate' layers")
+    
+    con = pop.incoming_connections[0]()
+    print(f"\tFeedforward {con.name}")
+
+def _export_recurrent(layer_group, pop):
+    # Check there's only one incoming connection
+    if len(pop.incoming_connections) != 2:
+        raise NotImplementedError("mlGeNN NetX exporter does not currently "
+                                  "support architectures requiring "
+                                  "'concatenate' layers")
+    
+    # Determine which incoming connection is 
+    # recurrent and which feedforward
+    if pop.incoming_connections[0]().source() == pop:
+        rec_con = pop.incoming_connections[0]()
+        ff_con = pop.incoming_connections[1]()
+    else:
+        ff_con = pop.incoming_connections[0]()
+        rec_con = pop.incoming_connections[1]()
+
+    print(f"\tRecurrent in={ff_con.name} rec={rec_con.name}")
+    
+    # Check that both connections have dense connectivity
+    if (not isinstance(rec_con.connectivity, Dense) 
+        or not isinstance(ff_con.connectivity, Dense)):
+            raise NotImplementedError("NetX only supports densely connected "
+                                      "recurrent layers")
     
 def export(path: str, inputs, outputs):
     """
     Export mlGeNN network to NetX
     """
+    # Build Directed Acyclical Graph 
+    # from lists of inputs and outputs
     dag = _get_network_dag(inputs, outputs)
     
-    print("DAG:")
-    for d in dag:
-        print(d[0].name, d[1])
 
     # "layer" group
     # each layer also a group with string name i.e. "0"
     # shape etc all datasets
+    # dense_rec
+    # "neuron" is group
+    #   
+    # "type" is S10 string
     
     with h5py.File(path, "w") as f:
-        pass
+        # Loop through layers in DAG
+        for i, (pop, rec) in enumerate(dag):
+            print(f"{i}:")
+        
+            # Create layer group
+            layer_group = f.create_group(f"/layer/{i}")
+            
+            # Add shape dataset
+            layer_group.create_dataset("shape", data=pop.shape, dtype="i8")
+            
+            # If this is the first population in DAG i.e. an input layer
+            if i == 0:
+                assert len(pop.incoming_connections) == 0
+                print("\tInput")
+                # Set layer type to input
+                layer_group.create_dataset("type", data="input", dtype="S10")
+            # Otherwise, if layer is recurrent
+            elif rec:
+                _export_recurrent(layer_group, pop)
+            # Otherwise, it must be feedforward
+            else:
+                _export_feedfoward(layer_group, pop)
+                
         
     
 
