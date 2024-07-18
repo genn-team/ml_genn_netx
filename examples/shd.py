@@ -80,7 +80,7 @@ export("shd.net", input, output, dt=DT)
 network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=max_timesteps)
 
 # **TODO** move to recurrent unit test
-print(network_lava.input_shape)
+assert network_lava.input_shape == (num_input,)
 assert len(network_lava) == 2
 assert type(network_lava.layers[0]) == netx.blocks.process.RecurrentDense
 assert type(network_lava.layers[1]) == netx.blocks.process.Dense
@@ -89,17 +89,27 @@ assert type(network_lava.layers[1]) == netx.blocks.process.Dense
 input_lava = SourceRingBuffer(data=tensors)
 input_lava.s_out.connect(network_lava.inp)
 
+n_samples = 100
 # Create monitor to record output voltages (shape is total timesteps)
 monitor_output = Monitor()
-monitor_output.probe(network_lava.layers[-1].neuron.v, tensors.shape[1])
+monitor_output.probe(network_lava.layers[-1].neuron.v, n_samples * max_timesteps)
 
 run_config = Loihi2SimCfg(select_tag="fixed_pt")
 
-for _ in tqdm(labels):
+for _ in tqdm(range(n_samples)):
     network_lava.run(condition=RunSteps(num_steps=max_timesteps), run_cfg=run_config)
 
 output_v = monitor_output.get_data()
+good = 0
+for i in range(n_samples):
+    out_v = output_v["neuron"]["v"][i*max_timesteps:(i+1)*max_timesteps,:]
+    sum_v = np.sum(out_v, axis=0)
+    pred = np.argmax(sum_v)
+    if pred == labels[i]:
+        good += 1
 
+
+print(f"test accuracy: {good/n_samples*100}")
 
 
 #output_v = out.data.get()
