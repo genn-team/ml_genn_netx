@@ -1,24 +1,27 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import mnist
+import lava.lib.dl.netx as netx
 
+from lava.magma.core.run_configs import Loihi2SimCfg
+from lava.magma.core.run_conditions import RunSteps
+from lava.proc.io.source import RingBuffer as SourceRingBuffer
+from lava.proc.monitor.process import Monitor
 from ml_genn import Connection, Network, Population
-from ml_genn.callbacks import Checkpoint, SpikeRecorder, VarRecorder
 from ml_genn.connectivity import Dense
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, SpikeInput
-from ml_genn.optimisers import Adam
 from ml_genn.serialisers import Numpy
 from ml_genn.synapses import Exponential
 from tonic.datasets import SHD
+from tonic.transforms import ToFrame
 
-from time import perf_counter
 from ml_genn.utils.data import (calc_latest_spike_time, calc_max_spikes,
                                 preprocess_tonic_spikes)
+from ml_genn_netx import export
+from tqdm import tqdm
 
 from ml_genn.compilers.event_prop_compiler import default_params
-
-from ml_genn_netx import export
 
 NUM_HIDDEN = 256
 BATCH_SIZE = 32
@@ -28,12 +31,28 @@ TRAIN = True
 KERNEL_PROFILING = True
 
 # Get SHD dataset
-#dataset = SHD(save_to='../data', train=TRAIN)
+dataset = SHD(save_to='../data', train=False, 
+              transform=ToFrame(sensor_size=SHD.sensor_size, time_window=1000.0))
 
 # Get number of input and output neurons from dataset 
-# and round up outputs to power-of-two
-num_input = 700#int(np.prod(dataset.sensor_size))
-num_output = 20#len(dataset.classes)
+num_input = int(np.prod(dataset.sensor_size))
+num_output = len(dataset.classes)
+max_timesteps = 1400
+
+# Preprocess
+tensors = []
+labels = []
+for i in range(len(dataset)):
+    tensor, label = dataset[i]
+    assert tensor.shape[-1] < max_timesteps
+    
+    # Transpose tensor and pad time to max
+    tensors.append(np.pad(np.reshape(np.transpose(tensor), (num_input, -1)),
+                          ((0, 0), (0, max_timesteps - tensor.shape[0]))))
+    labels.append(label)
+
+# Stack tensors
+tensors = np.hstack(tensors)
 
 serialiser = Numpy("shd_checkpoints")
 network = Network(default_params)
@@ -56,4 +75,32 @@ with network:
                Exponential(5.0))
 
 network.load((NUM_EPOCHS - 1,), serialiser)
-export("test.net", input, output)
+export("shd.net", input, output, dt=DT)
+
+network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=max_timesteps)
+
+# **TODO** move to recurrent unit test
+print(network_lava.input_shape)
+assert len(network_lava) == 2
+assert type(network_lava.layers[0]) == netx.blocks.process.RecurrentDense
+assert type(network_lava.layers[1]) == netx.blocks.process.Dense
+
+# Create source ring buffer to deliver input spike tensors and connect to network input port
+input_lava = SourceRingBuffer(data=tensors)
+input_lava.s_out.connect(network_lava.inp)
+
+# Create monitor to record output voltages (shape is total timesteps)
+monitor_output = Monitor()
+monitor_output.probe(network_lava.layers[-1].neuron.v, tensors.shape[1])
+
+run_config = Loihi2SimCfg(select_tag="fixed_pt")
+
+for _ in tqdm(labels):
+    network_lava.run(condition=RunSteps(num_steps=max_timesteps), run_cfg=run_config)
+
+output_v = monitor_output.get_data()
+
+
+
+#output_v = out.data.get()
+network_lava.stop()
