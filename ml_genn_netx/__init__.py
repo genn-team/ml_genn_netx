@@ -3,17 +3,16 @@ import math
 import numpy as np
 
 from numbers import Number
-from typing import Sequence
+from typing import Sequence, Tuple
 from ml_genn import Network, Population
 from ml_genn.connectivity import Dense
-from ml_genn.neurons import (IntegrateFire, LeakyIntegrate,
-                             LeakyIntegrateFire, Neuron)
-from ml_genn.synapses import (Delta, Exponential, Synapse)
+from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, Neuron
+from ml_genn.synapses import Delta, Exponential, Synapse
 
 from ml_genn.utils.network import get_underlying_pop
-from ml_genn.utils.value import is_value_array
+from ml_genn.utils.value import is_value_array, is_value_constant
 
-# **TODO** upstream extended version back into ml_genn.utils.quantisation
+# **TODO** upstream back into ml_genn.utils.quantisation
 def _find_signed_scale(data, num_bits: int, percentile: float):
     # Calculate desired percentile
     if isinstance(data, Number):
@@ -47,14 +46,25 @@ def _find_signed_scale(data, num_bits: int, percentile: float):
     # Return range and scale
     return min_quant, max_quant, scale
 
-# **TODO** upstream extended version back into ml_genn.utils.quantisation
-def _quantise_signed(data, num_bits: int, percentile: float):
-    # Find scaling factors
-    min_quant, max_quant, scale = _find_signed_scale(data, num_bits,
-                                                     percentile)
+def _to_array(value, shape):
+    if is_value_constant(value):
+        return np.tile(value, shape)
+    elif is_value_array(value):
+        assert value.shape == shape
+        return value
+    else:
+        raise NotImplementedError("NetX exporter does not support "
+                                  "parameters initialised with Initializers")
 
-    # Quantise, clip and return
-    return np.clip(scale * np.round(data / scale), min_quant, max_quant)
+def _to_fixed_point(data, scale, type):
+    # Apply scale and ensure values are within range of integer type
+    type_info = np.iinfo(type)
+    scaled_data = np.round(data * scale)
+    assert np.all((scaled_data >= type_info.min)
+                  & (scaled_data <= type_info.max))
+
+    # Round and cast
+    return scaled_data.astype(type)
 
 def _get_network_dag(inputs, outputs):
     # Convert inputs and outputs to tuples
@@ -97,32 +107,94 @@ def _get_network_dag(inputs, outputs):
     # Zip DAG back together with recurrentness 
     return list(zip(dag, recurrent))
 
-def _export_neuron(layer_group: h6py.Group, shape,
+def _export_neuron(layer_group: h5py.Group, shape, dt,
                    neuron: Neuron, synapse: Synapse):
     # Create group
     neuron_group = layer_group.create_group("neuron")
     neuron_group.create_dataset("gradedSpike", dtype="b1")
     neuron_group.create_dataset("refDelay", dtype="i4")
     neuron_group.create_dataset("vThMant", dtype="i4")
+
+    # If connections have exponential synapses
+    if isinstance(synapse, Exponential):
+        # Ensure we have an array of tau values
+        tau_syn = _to_array(synapse.tau, shape)
+        
+        # Calculate decays and convert to fixed point
+        i_decay_fixed_point = _to_fixed_point(np.exp(-dt / tau_syn), 2 ** 12,
+                                              "i4")
+        neuron_group.create_dataset("iDecay", data=i_decay_fixed_point,
+                                    dtype="i4")
+    # Otherwise, if synapse is plain delta, add empty iDecay
+    elif isinstance(synapse, Delta):
+        neuron_group.create_dataset("iDecay", dtype="i4")
+    else:
+        raise NotImplementedError(f"NetX doesn't support "
+                                  f"{type(synapse).__name__} synapses")
+
+    # If neuron model has leak
+    if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
+        neuron_group.create_dataset("type", data="CUBA")
+        
+        # Ensure we have an array of tau values
+        tau_mem = _to_array(neuron.tau_mem, shape)
+
+        # **TODO** threshold? refractory?
+
+        # Calculate decays and convert to fixed point
+        v_decay = np.exp(-dt / tau_mem)
+        v_decay_fixed_point = _to_fixed_point(v_decay, 2 ** 12,
+                                              "i4")
+        neuron_group.create_dataset("vDecay", data=v_decay_fixed_point,
+                                    dtype="i4")
+
+        # If neuron scales input, multiply by scale factor and return
+        return (1.0 - v_decay) if neuron.scale_i else 1.0
+
+    else:
+        raise NotImplementedError(f"NetX doesn't support "
+                                  f"{type(neuron).__name__} neurons")
+
+def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]], 
+                     num_bits: int, quant_percentile: float,
+                     weight_scale: float):
     
-    #if isinstance(neuron,
-    return 1.0
+    # Reshape weights into (num_src, num_trg) shape and apply weight scale
+    # **NOTE** weight scale may be a scalar or num_trg long vector
+    weights = [(np.reshape(w, (s, t)) * weight_scale, s, t)
+                for w, s, t in weights]
+    
+    # Flatten and concatenate weights and find scaling factors
+    weights_concat = np.concatenate([w.flatten() for w, _, _ in weights])
+    min_quant, max_quant, scale = _find_signed_scale(weights_concat, num_bits,
+                                                     quant_percentile)
+
+    # Take transpose of weights, quantise, clip and scale
+    quant_weights = [np.clip(scale * np.round(np.transpose(w) / scale),
+                             min_quant, max_quant) / scale
+                     for w, _, _ in weights]
+    print(f"\tWeight scale {1 / scale}")
+    # For convenience, return list if multiple inputs, otherwise single value
+    return (quant_weights if len(quant_weights) > 1
+            else quant_weights[0])
+    
 
 def _export_feedfoward(layer_group: h5py.Group, pop: Population,
-                       num_weight_bits: int, quant_percentile: float):
+                       dt: float, num_weight_bits: int,
+                       quant_percentile: float):
     # Check there's only one incoming connection
     if len(pop.incoming_connections) != 1:
         raise NotImplementedError("NetX does not currently support "
                                   "architectures with 'skip' connections")
-    
+
     con = pop.incoming_connections[0]()
     print(f"\tFeedforward {con.name}")
-    
+
     # Check weight is an array
     if not is_value_array(con.connectivity.weight):
         raise RuntimeError("Before exporting to NetX, weights "
                            "should be loaded from checkpoints")
-                               
+
     # If connectivity is dense
     if isinstance(con.connectivity, Dense):
         # Populate layer group
@@ -130,21 +202,28 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
         layer_group.create_dataset("outFeatures", dtype="i4")
         layer_group.create_dataset("type", data="dense", dtype="S10")
     else:
-        raise NotImplementedError("Connection {con.name} has "
-                                  "unsupported connectivity type")
+        raise NotImplementedError(f"NetX doesn't support "
+                                  f"{type(con.connectivity).__name__} "
+                                  f"connectivity")
 
     # Export neuron model and get weight scale
-    weight_scale = _export_neuron(layer_group, pop.shape,
+    weight_scale = _export_neuron(layer_group, pop.shape, dt,
                                   pop.neuron, con.synapse)
 
-    # Quantise weights
-    weights = con.connectivity.weight.flatten() * weight_scale
-    quant_weights = _quantise_signed(weights, num_weight_bits,
-                                     quant_percentile)
-    
+    # Convert weights to NetX format
+    num_src = np.prod(con.source().shape)
+    num_trg = np.prod(con.target().shape)
+    quant_weights = _get_netx_weight(
+        [(con.connectivity.weight, num_src, num_trg)], 
+        num_weight_bits, quant_percentile, weight_scale)
+
+    # Create dataset
+    layer_group.create_dataset("weight", data=quant_weights, dtype="f4")
+
 
 def _export_recurrent(layer_group: h5py.Group, pop: Population,
-                      num_weight_bits: int, quant_percentile: float):
+                      dt: float, num_weight_bits: int,
+                      quant_percentile: float):
     # Check there's only one incoming connection
     if len(pop.incoming_connections) != 2:
         raise NotImplementedError("NetX does not currently support "
@@ -179,25 +258,25 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
     layer_group.create_dataset("type", data="dense_rec", dtype="S10")
     
     # Export neuron model and get weight scale
-    weight_scale = _export_neuron(layer_group, pop.shape,
+    weight_scale = _export_neuron(layer_group, pop.shape, dt,
                                   pop.neuron, rec_con.synapse)
 
-    # Quantise recurrent and feedforward weights together
-    rec_weights = rec_con.connectivity.weight.flatten() * weight_scale
-    ff_weights = ff_con.connectivity.weight.flatten() * weight_scale
-    weights = np.concatenate((rec_weights, ff_weights))
+    # Convert weights to NetX format
+    num_src = np.prod(ff_con.source().shape)
+    num_trg = np.prod(ff_con.target().shape)
+    (rec_weights_quant, ff_weights_quant) = _get_netx_weight(
+        [(rec_con.connectivity.weight, num_trg, num_trg),
+         (ff_con.connectivity.weight, num_src, num_trg),], 
+        num_weight_bits, quant_percentile, weight_scale)
 
-    # Quantise together
-    quant_weights = _quantise_signed(weights, num_weight_bits,
-                                     quant_percentile)
-    
-    # Slice out original weights
-    rec_weights_quant = quant_weights[:len(rec_weights)]
-    ff_weights_quant = quant_weights[len(quant_weights):]
-    
-    
-def export(path: str, inputs, outputs, num_weight_bits: int = 8,
-           quant_percentile: float = 99.0):
+    # Create datasets
+    layer_group.create_dataset("weight", data=ff_weights_quant, dtype="f4")
+    layer_group.create_dataset("weight_rec", data=rec_weights_quant,
+                               dtype="f4")
+
+
+def export(path: str, inputs, outputs, dt: float = 1.0, 
+           num_weight_bits: int = 8, quant_percentile: float = 99.0):
     """
     Export mlGeNN network to NetX
     """
@@ -224,11 +303,11 @@ def export(path: str, inputs, outputs, num_weight_bits: int = 8,
                 layer_group.create_dataset("type", data="input", dtype="S10")
             # Otherwise, if layer is recurrent
             elif rec:
-                _export_recurrent(layer_group, pop, num_weight_bits,
+                _export_recurrent(layer_group, pop, dt, num_weight_bits,
                                   quant_percentile)
             # Otherwise, it must be feedforward
             else:
-                _export_feedfoward(layer_group, pop, num_weight_bits,
+                _export_feedfoward(layer_group, pop, dt, num_weight_bits,
                                    quant_percentile)
 
 
