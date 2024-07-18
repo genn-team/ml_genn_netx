@@ -121,9 +121,9 @@ def _export_neuron(layer_group: h5py.Group, shape, dt,
         tau_syn = _to_array(synapse.tau, shape)
         
         # Calculate decays and convert to fixed point
-        i_decay_fixed_point = _to_fixed_point(np.exp(-dt / tau_syn), 2 ** 12,
-                                              "i4")
-        neuron_group.create_dataset("iDecay", data=i_decay_fixed_point,
+        i_alpha_fixed_point = _to_fixed_point(1.0 - np.exp(-dt / tau_syn),
+                                              2 ** 12, "i4")
+        neuron_group.create_dataset("iDecay", data=i_alpha_fixed_point,
                                     dtype="i4")
     # Otherwise, if synapse is plain delta, add empty iDecay
     elif isinstance(synapse, Delta):
@@ -142,14 +142,14 @@ def _export_neuron(layer_group: h5py.Group, shape, dt,
         # **TODO** threshold? refractory?
 
         # Calculate decays and convert to fixed point
-        v_decay = np.exp(-dt / tau_mem)
-        v_decay_fixed_point = _to_fixed_point(v_decay, 2 ** 12,
+        v_alpha = 1.0 - np.exp(-dt / tau_mem)
+        v_alpha_fixed_point = _to_fixed_point(v_alpha, 2 ** 12,
                                               "i4")
-        neuron_group.create_dataset("vDecay", data=v_decay_fixed_point,
+        neuron_group.create_dataset("vDecay", data=v_alpha_fixed_point,
                                     dtype="i4")
 
         # If neuron scales input, multiply by scale factor and return
-        return (1.0 - v_decay) if neuron.scale_i else 1.0
+        return v_alpha if neuron.scale_i else 1.0
 
     else:
         raise NotImplementedError(f"NetX doesn't support "
