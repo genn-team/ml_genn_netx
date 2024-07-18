@@ -1,4 +1,5 @@
 import h5py
+import logging
 import math
 import numpy as np
 
@@ -11,6 +12,8 @@ from ml_genn.synapses import Delta, Exponential, Synapse
 
 from ml_genn.utils.network import get_underlying_pop
 from ml_genn.utils.value import is_value_array, is_value_constant
+
+logger = logging.getLogger(__name__)
 
 # **TODO** upstream back into ml_genn.utils.quantisation
 def _find_signed_scale(data, num_bits: int, percentile: float):
@@ -139,7 +142,7 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
     quant_weights = [np.clip(scale * np.round(np.transpose(w) / scale),
                              min_quant, max_quant) / scale
                      for w, _, _ in weights]
-    print(f"\tWeight scale {1 / scale}")
+    logger.info(f"\tWeight scale {1 / scale}")
     
     return scale, *quant_weights
 
@@ -214,7 +217,7 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
                                   "architectures with 'skip' connections")
 
     con = pop.incoming_connections[0]()
-    print(f"\tFeedforward {con.name}")
+    logger.info(f"\tFeedforward {con.name}")
 
     # Check weight is an array
     if not is_value_array(con.connectivity.weight):
@@ -268,7 +271,7 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
         ff_con = pop.incoming_connections[0]()
         rec_con = pop.incoming_connections[1]()
 
-    print(f"\tRecurrent in={ff_con.name} rec={rec_con.name}")
+    logger.info(f"\tRecurrent in={ff_con.name} rec={rec_con.name}")
     
     # Check that both connections have dense connectivity
     if (not isinstance(rec_con.connectivity, Dense) 
@@ -324,7 +327,7 @@ def export(path: str, inputs, outputs, dt: float = 1.0,
     with h5py.File(path, "w") as f:
         # Loop through layers in DAG
         for i, (pop, rec) in enumerate(dag):
-            print(f"{i}:")
+            logger.info(f"{i}:")
         
             # Create layer group
             layer_group = f.create_group(f"/layer/{i}")
@@ -333,9 +336,10 @@ def export(path: str, inputs, outputs, dt: float = 1.0,
             layer_group.create_dataset("shape", data=pop.shape, dtype="i8")
             
             # If this is the first population in DAG i.e. an input layer
+            # **TODO** non-spiking inputs need handling differently
             if i == 0:
                 assert len(pop.incoming_connections) == 0
-                print("\tInput")
+                logger.info("\tInput")
                 # Set layer type to input
                 layer_group.create_dataset("type", data="input", dtype="S10")
             # Otherwise, if layer is recurrent
