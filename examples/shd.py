@@ -29,6 +29,7 @@ NUM_EPOCHS = 300
 DT = 1.0
 TRAIN = True
 KERNEL_PROFILING = True
+NUM_TEST_SAMPLES = 10
 
 # Get SHD dataset
 dataset = SHD(save_to='../data', train=False, 
@@ -42,7 +43,7 @@ max_timesteps = 1400
 # Preprocess
 tensors = []
 labels = []
-for i in range(len(dataset)):
+for i in range(NUM_TEST_SAMPLES):
     tensor, label = dataset[i]
     assert tensor.shape[-1] < max_timesteps
     
@@ -89,28 +90,29 @@ assert type(network_lava.layers[1]) == netx.blocks.process.Dense
 input_lava = SourceRingBuffer(data=tensors)
 input_lava.s_out.connect(network_lava.inp)
 
-n_samples = 100
+
 # Create monitor to record output voltages (shape is total timesteps)
 monitor_output = Monitor()
-monitor_output.probe(network_lava.layers[-1].neuron.v, n_samples * max_timesteps)
+monitor_output.probe(network_lava.layers[-1].neuron.v, NUM_TEST_SAMPLES * max_timesteps)
 
 run_config = Loihi2SimCfg(select_tag="fixed_pt")
 
-for _ in tqdm(range(n_samples)):
+# Run model for each test sample
+for _ in tqdm(range(NUM_TEST_SAMPLES)):
     network_lava.run(condition=RunSteps(num_steps=max_timesteps), run_cfg=run_config)
 
-output_v = monitor_output.get_data()
-good = 0
-for i in range(n_samples):
-    out_v = output_v["neuron"]["v"][i*max_timesteps:(i+1)*max_timesteps,:]
-    sum_v = np.sum(out_v, axis=0)
-    pred = np.argmax(sum_v)
-    if pred == labels[i]:
-        good += 1
+# Get output and reshape
+output_v = monitor_output.get_data()["neuron"]["v"]
+output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, max_timesteps, num_output))
+
+# For each example, sum output neuron voltage over time
+sum_v = np.sum(output_v, axis=1)
+
+# Find maximum output neuron voltage and compare to label
+pred = np.argmax(sum_v, axis=1)
+good = np.sum(pred == labels)
+
+print(f"Test accuracy: {good/NUM_TEST_SAMPLES*100}%")
 
 
-print(f"test accuracy: {good/n_samples*100}")
-
-
-#output_v = out.data.get()
 network_lava.stop()
