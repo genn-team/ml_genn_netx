@@ -107,53 +107,19 @@ def _get_network_dag(inputs, outputs):
     # Zip DAG back together with recurrentness 
     return list(zip(dag, recurrent))
 
-def _export_neuron(layer_group: h5py.Group, shape, dt,
-                   neuron: Neuron, synapse: Synapse):
-    # Create group
-    neuron_group = layer_group.create_group("neuron")
-    neuron_group.create_dataset("gradedSpike", dtype="b1")
-    neuron_group.create_dataset("refDelay", dtype="i4")
-    neuron_group.create_dataset("vThMant", dtype="i4")
-
-    # If connections have exponential synapses
-    if isinstance(synapse, Exponential):
-        # Ensure we have an array of tau values
-        tau_syn = _to_array(synapse.tau, shape)
-        
-        # Calculate decays and convert to fixed point
-        i_alpha_fixed_point = _to_fixed_point(1.0 - np.exp(-dt / tau_syn),
-                                              2 ** 12, "i4")
-        neuron_group.create_dataset("iDecay", data=i_alpha_fixed_point,
-                                    dtype="i4")
-    # Otherwise, if synapse is plain delta, add empty iDecay
-    elif isinstance(synapse, Delta):
-        neuron_group.create_dataset("iDecay", dtype="i4")
-    else:
-        raise NotImplementedError(f"NetX doesn't support "
-                                  f"{type(synapse).__name__} synapses")
-
+def _get_weight_scale(neuron: Neuron, shape, dt: float):
     # If neuron model has leak
     if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
-        neuron_group.create_dataset("type", data="CUBA")
-        
         # Ensure we have an array of tau values
         tau_mem = _to_array(neuron.tau_mem, shape)
 
-        # **TODO** threshold? refractory?
-
         # Calculate decays and convert to fixed point
         v_alpha = 1.0 - np.exp(-dt / tau_mem)
-        v_alpha_fixed_point = _to_fixed_point(v_alpha, 2 ** 12,
-                                              "i4")
-        neuron_group.create_dataset("vDecay", data=v_alpha_fixed_point,
-                                    dtype="i4")
-
-        # If neuron scales input, multiply by scale factor and return
+        
         return v_alpha if neuron.scale_i else 1.0
-
     else:
-        raise NotImplementedError(f"NetX doesn't support "
-                                  f"{type(neuron).__name__} neurons")
+        return 1.0
+
 
 def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]], 
                      num_bits: int, quant_percentile: float,
@@ -174,9 +140,69 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
                              min_quant, max_quant) / scale
                      for w, _, _ in weights]
     print(f"\tWeight scale {1 / scale}")
-    # For convenience, return list if multiple inputs, otherwise single value
-    return (quant_weights if len(quant_weights) > 1
-            else quant_weights[0])
+    
+    return scale, *quant_weights
+
+def _export_neuron(layer_group: h5py.Group, shape, dt: float, 
+                   quant_scale: float, neuron: Neuron, synapse: Synapse):
+    # Create group
+    neuron_group = layer_group.create_group("neuron")
+    neuron_group.create_dataset("gradedSpike", dtype="b1")
+    neuron_group.create_dataset("refDelay", dtype="i4")
+
+    # If connections have exponential synapses
+    if isinstance(synapse, Exponential):
+        # Ensure we have an array of tau values
+        tau_syn = _to_array(synapse.tau, shape)
+        
+        # Calculate decays and convert to fixed point
+        i_alpha_fixed_point = _to_fixed_point(1.0 - np.exp(-dt / tau_syn),
+                                              2 ** 12, "i4")
+        neuron_group.create_dataset("iDecay", data=i_alpha_fixed_point,
+                                    dtype="i4")
+    # Otherwise, if synapse is plain delta, add empty iDecay
+    elif isinstance(synapse, Delta):
+        neuron_group.create_dataset("iDecay", dtype="i4")
+    else:
+        raise NotImplementedError(f"NetX doesn't support "
+                                  f"{type(synapse).__name__} synapses")
+
+    # If neuron model has leak
+    # **TODO** if IntegrateFire do something like:
+    # {'type': 'CUBA',
+    #    'iDecay': 0,
+    #    'vDecay': 4096,
+    #    'vThMant': 1 << 18 - 1,
+    #    'refDelay': 1,
+    if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
+        neuron_group.create_dataset("type", data="CUBA")
+        
+        # Ensure we have an array of tau values
+        # **CHECK** is this necessary?
+        tau_mem = _to_array(neuron.tau_mem, shape)
+
+        # Calculate decays, convert to fixed point and store in dataset
+        v_alpha = 1.0 - np.exp(-dt / tau_mem)
+        v_alpha_fixed_point = _to_fixed_point(v_alpha, 2 ** 12,
+                                              "i4")
+        neuron_group.create_dataset("vDecay", data=v_alpha_fixed_point,
+                                    dtype="i4")
+        
+        # If neuron spikes, scale its threshold by quantisation scale
+        # **CHECK** I am pretty sure this isn't the correct way to scale
+        if isinstance(neuron, LeakyIntegrateFire):
+            v_thresh = np.round(_to_array(neuron.v_thresh, shape) / quant_scale).astype("i4")
+        # Otherwise, set extremely high threshold
+        # **YUCK** this also isn't ideal
+        else:
+            v_thresh = 2**30
+        
+        # Add threshold dataset
+        neuron_group.create_dataset("vThMant", data=v_thresh, dtype="i4")
+
+    else:
+        raise NotImplementedError(f"NetX doesn't support "
+                                  f"{type(neuron).__name__} neurons")
     
 
 def _export_feedfoward(layer_group: h5py.Group, pop: Population,
@@ -206,19 +232,23 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
                                   f"{type(con.connectivity).__name__} "
                                   f"connectivity")
 
-    # Export neuron model and get weight scale
-    weight_scale = _export_neuron(layer_group, pop.shape, dt,
-                                  pop.neuron, con.synapse)
+    # Due to implementation details, weights need scaling to 
+    # match some mlGeNN neuron types so calculate first
+    weight_scale = _get_weight_scale(pop.neuron, pop.shape, dt)
 
     # Convert weights to NetX format
     num_src = np.prod(con.source().shape)
     num_trg = np.prod(con.target().shape)
-    quant_weights = _get_netx_weight(
+    quant_scale, quant_weights = _get_netx_weight(
         [(con.connectivity.weight, num_src, num_trg)], 
         num_weight_bits, quant_percentile, weight_scale)
 
     # Create dataset
     layer_group.create_dataset("weight", data=quant_weights, dtype="f4")
+    
+    # Export neuron model
+    _export_neuron(layer_group, pop.shape, dt, quant_scale,
+                   pop.neuron, con.synapse)
 
 
 def _export_recurrent(layer_group: h5py.Group, pop: Population,
@@ -251,28 +281,35 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
         or not is_value_array(ff_con.connectivity.weight)):
             raise RuntimeError("Before exporting to NetX, weights "
                                "should be loaded from checkpoints")
+    
+    # **TODO** check synapse models match
 
     # Populate layer group
     layer_group.create_dataset("inFeatures", dtype="i4")
     layer_group.create_dataset("outFeatures", dtype="i4")
     layer_group.create_dataset("type", data="dense_rec", dtype="S10")
     
-    # Export neuron model and get weight scale
-    weight_scale = _export_neuron(layer_group, pop.shape, dt,
-                                  pop.neuron, rec_con.synapse)
-
+    # Due to implementation details, weights need scaling to 
+    # match some mlGeNN neuron types so calculate first
+    weight_scale = _get_weight_scale(pop.neuron, pop.shape, dt)
+    
     # Convert weights to NetX format
     num_src = np.prod(ff_con.source().shape)
     num_trg = np.prod(ff_con.target().shape)
-    (rec_weights_quant, ff_weights_quant) = _get_netx_weight(
+    quant_scale, quant_rec_weights, quant_ff_weights = _get_netx_weight(
         [(rec_con.connectivity.weight, num_trg, num_trg),
          (ff_con.connectivity.weight, num_src, num_trg),], 
         num_weight_bits, quant_percentile, weight_scale)
 
     # Create datasets
-    layer_group.create_dataset("weight", data=ff_weights_quant, dtype="f4")
-    layer_group.create_dataset("weight_rec", data=rec_weights_quant,
+    layer_group.create_dataset("weight", data=quant_ff_weights, dtype="f4")
+    layer_group.create_dataset("weight_rec", data=quant_rec_weights,
                                dtype="f4")
+    
+    # Export neuron model
+    _export_neuron(layer_group, pop.shape, dt, quant_scale,
+                   pop.neuron, rec_con.synapse)
+
 
 
 def export(path: str, inputs, outputs, dt: float = 1.0, 
