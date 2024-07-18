@@ -319,6 +319,20 @@ def export(path: str, inputs, outputs, dt: float = 1.0,
            num_weight_bits: int = 8, quant_percentile: float = 99.0):
     """
     Export mlGeNN network to NetX
+    
+    Args:
+        path:               Path to NetX file to generate
+        inputs:             Sequence of mlGeNN :class:`ml_genn.Population`
+                            or :class:`ml_genn.InputLayer` objects where 
+                            input is applied
+        outputs:            Sequence of mlGeNN :class:`ml_genn.Population`
+                            or :class:`ml_genn.Layer` objects where 
+                            output is read
+        dt:                 Desired simulation timestep in milliseconds 
+                            for Lava simulation
+        num_weight_bits:    Number of bits to quantise synaptic weights to
+        quant_percentile:   What percentage of weight distribution should
+                            quantised format aim to encompass
     """
     # Build Directed Acyclical Graph 
     # from lists of inputs and outputs
