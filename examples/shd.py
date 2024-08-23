@@ -9,6 +9,7 @@ from lava.magma.core.run_conditions import RunSteps
 from lava.proc.io.source import RingBuffer as SourceRingBuffer
 from lava.proc.monitor.process import Monitor
 from ml_genn import Connection, Network, Population
+from ml_genn.callbacks import SpikeRecorder, VarRecorder
 from ml_genn.compilers import InferenceCompiler
 from ml_genn.connectivity import Dense
 from ml_genn.initializers import Normal
@@ -29,8 +30,9 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 300
 DT = 1.0
 TRAIN = True
+PLOT = False
 KERNEL_PROFILING = True
-NUM_TEST_SAMPLES = 10
+NUM_TEST_SAMPLES = 200
 MAX_TIMESTEPS = 1400
 
 def get_dataset_num_in_out(dataset):
@@ -47,10 +49,10 @@ def build_ml_genn_model(dataset):
     with network:
         # Populations
         input = Population(SpikeInput(max_spikes=BATCH_SIZE * 15000),
-                           num_input, name="Input")
+                           num_input, name="Input", record_spikes=True)
         hidden = Population(LeakyIntegrateFire(v_thresh=1.0, tau_mem=20.0,
                                                tau_refrac=None),
-                            NUM_HIDDEN, name="Hidden")
+                            NUM_HIDDEN, name="Hidden", record_spikes=True)
         output = Population(LeakyIntegrate(tau_mem=20.0, readout="avg_var_exp_weight"),
                             num_output, name="Output")
 
@@ -63,9 +65,9 @@ def build_ml_genn_model(dataset):
                    Exponential(5.0))
 
     network.load((NUM_EPOCHS - 1,), serialiser)
-    return network, input, output
+    return network, input, hidden, output
 
-def evaluate_genn(dataset, network, input, output):
+def evaluate_genn(dataset, network, input, hidden, output, plot):
     # Preprocess
     spikes = []
     labels = []
@@ -81,11 +83,27 @@ def evaluate_genn(dataset, network, input, output):
     compiled_net = compiler.compile(network)
 
     with compiled_net:
-        metrics, _  = compiled_net.evaluate({input: spikes},
-                                            {output: labels})
-        print(f"GeNN test accuracy = {100 * metrics[output].result}%")
+        callbacks = ["batch_progress_bar"]
+        if plot:
+            callbacks.extend([SpikeRecorder(hidden, key="hidden_spikes"),
+                              VarRecorder(output, "v", key="output_v")])
 
-def evaluate_lava(dataset, net_x_filename):
+        metrics, cb_data  = compiled_net.evaluate({input: spikes},
+                                                  {output: labels},
+                                                  callbacks=callbacks)
+
+        print(f"GeNN test accuracy = {100 * metrics[output].result}%")
+        
+        if plot:
+            fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
+            for a in range(NUM_TEST_SAMPLES):
+                axes[0, a].scatter(cb_data["hidden_spikes"][0][a], cb_data["hidden_spikes"][1][a], s=1)
+                axes[1, a].plot(cb_data["output_v"][a])
+            
+            axes[0, 0].set_ylabel("Hidden neuron ID")
+            axes[1, 0].set_ylabel("Output voltage")
+
+def evaluate_lava(dataset, net_x_filename, plot):
     # Preprocess
     num_input, num_output = get_dataset_num_in_out(dataset)
     transform = ToFrame(sensor_size=SHD.sensor_size, time_window=1000.0)
@@ -122,6 +140,10 @@ def evaluate_lava(dataset, net_x_filename):
     monitor_output = Monitor()
     monitor_output.probe(network_lava.layers[-1].neuron.v, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
 
+    if plot:
+        monitor_hidden = Monitor()
+        monitor_hidden.probe(network_lava.layers[0].neuron.s_out, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
+
     run_config = Loihi2SimCfg(select_tag="fixed_pt")
 
     # Run model for each test sample
@@ -140,7 +162,18 @@ def evaluate_lava(dataset, net_x_filename):
     good = np.sum(pred == labels)
 
     print(f"Lava test accuracy: {good/NUM_TEST_SAMPLES*100}%")
-
+    if plot:
+        hidden_spikes = monitor_hidden.get_data()["neuron"]["s_out"]
+        hidden_spikes = np.reshape(hidden_spikes, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
+        
+        fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
+        for a in range(NUM_TEST_SAMPLES):
+            sample_hidden_spikes = np.where(hidden_spikes[a,:,:] > 0.0)
+            axes[0, a].scatter(sample_hidden_spikes[0], sample_hidden_spikes[1], s=1)
+            axes[1, a].plot(output_v[a,:,:])
+        
+        axes[0,0].set_ylabel("Hidden neuron ID")
+        axes[1,0].set_ylabel("Output voltage")
 
     network_lava.stop()
 
@@ -151,16 +184,18 @@ if __name__ == "__main__":
     dataset = SHD(save_to='../data', train=False)
 
     # Build suitable mlGeNN model
-    network, input, output = build_ml_genn_model(dataset)
+    network, input, hidden, output = build_ml_genn_model(dataset)
 
     # Evaluate in GeNN
-    evaluate_genn(dataset, network, input, output)
+    evaluate_genn(dataset, network, input, hidden, output, PLOT)
 
     # Export to netx
     export("shd.net", input, output, dt=DT)
 
     # Evaluate in Lava
-    evaluate_lava(dataset, "shd.net")
+    evaluate_lava(dataset, "shd.net", PLOT)
+
+    plt.show()
 
 
 

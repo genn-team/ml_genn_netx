@@ -142,7 +142,7 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
     quant_weights = [np.clip(scale * np.round(np.transpose(w) / scale),
                              min_quant, max_quant) / scale
                      for w, _, _ in weights]
-    logger.info(f"\tWeight scale {1 / scale}")
+    logger.info(f"\tWeight scale: {1 / scale}, Min max quant: {min_quant}, {max_quant}")
     
     return scale, *quant_weights
 
