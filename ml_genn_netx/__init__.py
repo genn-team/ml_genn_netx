@@ -49,9 +49,9 @@ def _find_signed_scale(data, num_bits: int, percentile: float):
     # Return range and scale
     return min_quant, max_quant, scale
 
-def _to_array(value, shape):
+def _check_param(value, shape):
     if is_value_constant(value):
-        return np.tile(value, shape)
+        return value
     elif is_value_array(value):
         assert value.shape == shape
         return value
@@ -114,7 +114,7 @@ def _get_weight_scale(neuron: Neuron, shape, dt: float):
     # If neuron model has leak
     if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
         # Ensure we have an array of tau values
-        tau_mem = _to_array(neuron.tau_mem, shape)
+        tau_mem = _check_param(neuron.tau_mem, shape)
 
         # Calculate decays and convert to fixed point
         v_alpha = 1.0 - np.exp(-dt / tau_mem)
@@ -151,58 +151,75 @@ def _export_neuron(layer_group: h5py.Group, shape, dt: float,
     # Create group
     neuron_group = layer_group.create_group("neuron")
     neuron_group.create_dataset("gradedSpike", dtype="b1")
-    neuron_group.create_dataset("refDelay", dtype="i4")
 
     # If connections have exponential synapses
     if isinstance(synapse, Exponential):
         # Ensure we have an array of tau values
-        tau_syn = _to_array(synapse.tau, shape)
+        tau_syn = _check_param(synapse.tau, shape)
         
         # Calculate decays and convert to fixed point
         i_alpha_fixed_point = _to_fixed_point(1.0 - np.exp(-dt / tau_syn),
                                               2 ** 12, "i4")
-        neuron_group.create_dataset("iDecay", data=i_alpha_fixed_point,
-                                    dtype="i4")
     # Otherwise, if synapse is plain delta, add empty iDecay
     elif isinstance(synapse, Delta):
-        neuron_group.create_dataset("iDecay", dtype="i4")
+        i_alpha_fixed_point = 2 ** 12
     else:
         raise NotImplementedError(f"NetX doesn't support "
                                   f"{type(synapse).__name__} synapses")
 
-    # If neuron model has leak
-    # **TODO** if IntegrateFire do something like:
-    # {'type': 'CUBA',
-    #    'iDecay': 0,
-    #    'vDecay': 4096,
-    #    'vThMant': 1 << 18 - 1,
-    #    'refDelay': 1,
+    logger.info(f"\tNeuron synaptic decay {i_alpha_fixed_point}")
+    neuron_group.create_dataset("iDecay", data=i_alpha_fixed_point,
+                                dtype="i4")
+
+    # If neuron model should be implemented as CUBA
     if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
         neuron_group.create_dataset("type", data="CUBA")
-        
-        # Ensure we have an array of tau values
-        # **CHECK** is this necessary?
-        tau_mem = _to_array(neuron.tau_mem, shape)
+
+        # Get tau
+        tau_mem = _check_param(neuron.tau_mem, shape)
 
         # Calculate decays, convert to fixed point and store in dataset
         v_alpha = 1.0 - np.exp(-dt / tau_mem)
         v_alpha_fixed_point = _to_fixed_point(v_alpha, 2 ** 12,
                                               "i4")
-        neuron_group.create_dataset("vDecay", data=v_alpha_fixed_point,
-                                    dtype="i4")
-        
-        # If neuron spikes, scale its threshold by quantisation scale
-        # **CHECK** I am pretty sure this isn't the correct way to scale
+
+        # If neuron spikes
         if isinstance(neuron, LeakyIntegrateFire):
-            v_thresh = np.round(_to_array(neuron.v_thresh, shape) / quant_scale).astype("i4")
+            # Check reset mechanism is compatible
+            if neuron.relative_reset:
+                logger.warning("Lava CUBA model does not support relative "
+                               "membrane voltage reset")
+
+            # Scale its threshold by quantisation scale
+            v_thresh = _check_param(neuron.v_thresh, shape)
+            v_thresh_fixed_point = _to_fixed_point(
+                v_thresh, 1.0 / quant_scale, "i4")
+            
+            # If neuron has no refractory time, use zero
+            if neuron.tau_refrac is None:
+                ref_delay = 0
+            # Otherwise, convert to timesteps
+            # **TODO** check integrate_during_refrac behaviour
+            else:
+                ref_delay = np.round(
+                    _check_param(neuron.tau_refrac, shape) / dt)
+
         # Otherwise, set extremely high threshold
         # **YUCK** this also isn't ideal
         else:
-            v_thresh = 2**30
-        
-        # Add threshold dataset
-        neuron_group.create_dataset("vThMant", data=v_thresh, dtype="i4")
+            v_thresh_fixed_point = 2**30
+            ref_delay = 0
 
+        logger.info(f"\tNeuron membrane decay {v_alpha_fixed_point}")
+        logger.info(f"\tNeuron threshold {v_thresh_fixed_point}")
+        logger.info(f"\tNeuron refractory timesteps {ref_delay}")
+
+        # Add datasets
+        neuron_group.create_dataset("vDecay", data=v_alpha_fixed_point, 
+                                    dtype="i4")
+        neuron_group.create_dataset("vThMant", data=v_thresh_fixed_point,
+                                    dtype="i4")
+        neuron_group.create_dataset("refDelay", data=ref_delay, dtype="i4")
     else:
         raise NotImplementedError(f"NetX doesn't support "
                                   f"{type(neuron).__name__} neurons")
@@ -261,7 +278,7 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
     if len(pop.incoming_connections) != 2:
         raise NotImplementedError("NetX does not currently support "
                                   "architectures with 'skip' connections")
-    
+
     # Determine which incoming connection is 
     # recurrent and which feedforward
     if pop.incoming_connections[0]().source() == pop:
@@ -272,7 +289,7 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
         rec_con = pop.incoming_connections[1]()
 
     logger.info(f"\tRecurrent in={ff_con.name} rec={rec_con.name}")
-    
+
     # Check that both connections have dense connectivity
     if (not isinstance(rec_con.connectivity, Dense) 
         or not isinstance(ff_con.connectivity, Dense)):
@@ -284,18 +301,18 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
         or not is_value_array(ff_con.connectivity.weight)):
             raise RuntimeError("Before exporting to NetX, weights "
                                "should be loaded from checkpoints")
-    
+
     # **TODO** check synapse models match
 
     # Populate layer group
     layer_group.create_dataset("inFeatures", dtype="i4")
     layer_group.create_dataset("outFeatures", dtype="i4")
     layer_group.create_dataset("type", data="dense_rec", dtype="S10")
-    
+
     # Due to implementation details, weights need scaling to 
     # match some mlGeNN neuron types so calculate first
     weight_scale = _get_weight_scale(pop.neuron, pop.shape, dt)
-    
+
     # Convert weights to NetX format
     num_src = np.prod(ff_con.source().shape)
     num_trg = np.prod(ff_con.target().shape)
@@ -308,7 +325,7 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
     layer_group.create_dataset("weight", data=quant_ff_weights, dtype="f4")
     layer_group.create_dataset("weight_rec", data=quant_rec_weights,
                                dtype="f4")
-    
+
     # Export neuron model
     _export_neuron(layer_group, pop.shape, dt, quant_scale,
                    pop.neuron, rec_con.synapse)
