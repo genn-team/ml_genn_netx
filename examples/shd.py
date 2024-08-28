@@ -9,72 +9,215 @@ from lava.magma.core.run_conditions import RunSteps
 from lava.proc.io.source import RingBuffer as SourceRingBuffer
 from lava.proc.monitor.process import Monitor
 from ml_genn import Connection, Network, Population
-from ml_genn.callbacks import SpikeRecorder, VarRecorder
-from ml_genn.compilers import InferenceCompiler
+from ml_genn.callbacks import Callback, Checkpoint, SpikeRecorder, VarRecorder
+from ml_genn.compilers import EventPropCompiler, InferenceCompiler
 from ml_genn.connectivity import Dense
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, SpikeInput
+from ml_genn.optimisers import Adam
 from ml_genn.serialisers import Numpy
 from ml_genn.synapses import Exponential
 from tonic.datasets import SHD
-from tonic.transforms import ToFrame
+from tonic.transforms import CropTime, ToFrame
 
+from copy import deepcopy
 from ml_genn.utils.data import preprocess_tonic_spikes
 from ml_genn_netx import export
 from tqdm import tqdm
 
 from ml_genn.compilers.event_prop_compiler import default_params
 
-NUM_HIDDEN = 256
+NUM_HIDDEN = 1024
 BATCH_SIZE = 32
-NUM_EPOCHS = 300
+NUM_EPOCHS = 50
 DT = 1.0
 TRAIN = True
 PLOT = False
 KERNEL_PROFILING = True
 NUM_TEST_SAMPLES = 200
-MAX_TIMESTEPS = 1400
+MAX_TIMESTEPS = 1000
 
-def get_dataset_num_in_out(dataset):
-    # Get number of input and output neurons from dataset 
-    num_input = int(np.prod(dataset.sensor_size))
-    num_output = len(dataset.classes)
 
-    return num_input, num_output
+class EaseInSchedule(Callback):
+    def __init__(self):
+        pass
 
-def build_ml_genn_model(dataset):
-    num_input, num_output = get_dataset_num_in_out(dataset)
-    serialiser = Numpy("shd_checkpoints")
+    def set_params(self, compiled_network, **kwargs):
+        self._optimisers = [optimiser[0] for optimiser in compiled_network.optimisers[:3]]
+
+    def on_batch_begin(self, batch):
+        # Set parameter to return value of function
+        for optimiser in self._optimisers:
+            if optimiser.alpha < 0.001 :
+                optimiser.alpha = (0.001 / 1000.0) * (1.05 ** batch)
+            else:
+                optimiser.alpha = 0.001
+
+
+class Shift:
+    def __init__(self, f_shift, sensor_size):
+        self.f_shift = f_shift
+        self.sensor_size = sensor_size
+
+    def __call__(self, events: np.ndarray) -> np.ndarray:
+        # Shift events
+        events_copy = deepcopy(events)
+        events_copy["x"] = events_copy["x"] + np.random.randint(-self.f_shift, self.f_shift)
+
+        # Delete out of bound events
+        events_copy = np.delete(
+            events_copy,
+            np.where(
+                (events_copy["x"] < 0) | (events_copy["x"] >= self.sensor_size[0])))
+        return events_copy
+
+
+class Blend:
+    def __init__(self, p_blend, sensor_size):
+        self.p_blend = p_blend
+        self.n_blend = 7644
+        self.sensor_size = sensor_size
+
+    def __call__(self, dataset: list, classes: list) -> list:
+        for i in range(self.n_blend):
+            idx = np.random.randint(0,len(dataset))
+            idx2 = np.random.randint(0,len(classes[dataset[idx][1]]))
+            assert dataset[idx][1] == dataset[classes[dataset[idx][1]][idx2]][1]
+            dataset.append((self.blend(dataset[idx][0], dataset[classes[dataset[idx][1]][idx2]][0]), dataset[idx][1]))
+
+        return dataset
+
+    def blend(self, X1, X2):
+        X1 = deepcopy(X1)
+        X2 = deepcopy(X2)
+        mx1 = np.mean(X1["x"])
+        mx2 = np.mean(X2["x"])
+        mt1 = np.mean(X1["t"])
+        mt2 = np.mean(X2["t"])
+        X1["x"]+= int((mx2-mx1)/2)
+        X2["x"]+= int((mx1-mx2)/2)
+        X1["t"]+= int((mt2-mt1)/2)
+        X2["t"]+= int((mt1-mt2)/2)
+        max_t = MAX_TIMESTEPS * 1000.0
+        X1 = np.delete(
+            X1,
+            np.where(
+                (X1["x"] < 0) | (X1["x"] >= self.sensor_size[0]) | (X1["t"] < 0) | (X1["t"] >= max_t)))
+        X2 = np.delete(
+            X2,
+            np.where(
+                (X2["x"] < 0) | (X2["x"] >= self.sensor_size[0]) | (X2["t"] < 0) | (X2["t"] >= max_t)))
+        mask1 = np.random.rand(X1["x"].shape[0]) < self.p_blend
+        mask2 = np.random.rand(X2["x"].shape[0]) < self.p_blend
+        X1_X2 = np.concatenate([X1[mask1], X2[mask2]])
+        idx= np.argsort(X1_X2["t"])
+        X1_X2 = X1_X2[idx]
+        return X1_X2
+
+def load_data(train, num=None):
+    # Get SHD dataset
+    dataset = SHD(save_to='../data', train=train,
+                  transform=CropTime(max=MAX_TIMESTEPS * 1000.0))
+    
+    raw_data = []
+    for i in range(num if num is not None else len(dataset)):
+        raw_data.append(dataset[i])
+
+    return raw_data, dataset.sensor_size, dataset.ordering, len(dataset.classes)
+
+def build_ml_genn_model(sensor_size, num_classes):
     network = Network(default_params)
     with network:
         # Populations
         input = Population(SpikeInput(max_spikes=BATCH_SIZE * 15000),
-                           num_input, name="Input", record_spikes=True)
+                           int(np.prod(sensor_size)), 
+                           name="Input", record_spikes=True)
         hidden = Population(LeakyIntegrateFire(v_thresh=1.0, tau_mem=20.0,
                                                tau_refrac=None),
                             NUM_HIDDEN, name="Hidden", record_spikes=True)
         output = Population(LeakyIntegrate(tau_mem=20.0, readout="avg_var_exp_weight"),
-                            num_output, name="Output")
+                            num_classes, name="Output")
 
         # Connections
-        Connection(input, hidden, Dense(Normal(mean=0.03, sd=0.01)),
-                   Exponential(5.0))
+        input_hidden = Connection(input, hidden, 
+                                  Dense(Normal(mean=0.03, sd=0.01)),
+                                  Exponential(5.0))
         Connection(hidden, hidden, Dense(Normal(mean=0.0, sd=0.02)),
                    Exponential(5.0))
         Connection(hidden, output, Dense(Normal(mean=0.0, sd=0.03)),
                    Exponential(5.0))
 
-    network.load((NUM_EPOCHS - 1,), serialiser)
-    return network, input, hidden, output
+    return network, input, hidden, output, input_hidden
 
-def evaluate_genn(dataset, network, input, hidden, output, plot):
+def train_genn(raw_data, network, serialiser,
+               input, hidden, output, input_hidden,
+               sensor_size, ordering):
+    # Create EventProp compiler
+    compiler = EventPropCompiler(example_timesteps=MAX_TIMESTEPS,
+                                losses="sparse_categorical_crossentropy",
+                                reg_lambda_upper=5e-11, reg_lambda_lower=5e-11, 
+                                reg_nu_upper=14, max_spikes=1500, 
+                                optimiser=Adam(0.001 * 0.01), batch_size=BATCH_SIZE)
+    # Create augmentation objects
+    shift = Shift(40.0, sensor_size)
+    blend = Blend(0.5, sensor_size)
+
+    # Build classes list
+    classes = [[] for _ in range(np.prod(output.shape))]
+    for i, (_, label) in enumerate(raw_data):
+        classes[label].append(i)
+    
+    # Compile network
+    compiled_net = compiler.compile(network)
+    input_hidden_sg = compiled_net.connection_populations[input_hidden]
+    # Train
+    with compiled_net:
+        callbacks = [Checkpoint(serialiser), EaseInSchedule(),
+                     SpikeRecorder(hidden, key="hidden_spikes",
+                                   record_counts=True)]
+        
+        # Loop through epochs
+        for e in range(NUM_EPOCHS):
+            # Apply augmentation to events and preprocess
+            spikes_train = []
+            labels_train = []
+            blended_dataset = blend(raw_data, classes)
+            for events, label in blended_dataset:
+                spikes_train.append(preprocess_tonic_spikes(shift(events), ordering,
+                                                            sensor_size, dt=DT,
+                                                            histogram_thresh=1))
+                labels_train.append(label)
+            
+            # Train epoch
+            metrics, cb_data  = compiled_net.train(
+                {input: spikes_train}, {output: labels_train},
+                start_epoch=e, num_epochs=1, 
+                shuffle=True, callbacks=callbacks)
+
+            # Sum number of hidden spikes in each batch
+            hidden_spikes = np.zeros(NUM_HIDDEN)
+            for cb_d in cb_data["hidden_spikes"]:
+                hidden_spikes += cb_d
+
+            num_silent = np.count_nonzero(hidden_spikes==0)
+            print(f"GeNN training epoch: {e}, Silent neurons: {num_silent}, Training accuracy: {100 * metrics[output].result}%")
+            
+            if num_silent > 0:
+                input_hidden_sg.vars["g"].pull_from_device()
+                g_view = input_hidden_sg.vars["g"].view.reshape((np.prod(input.shape), NUM_HIDDEN))
+                g_view[:,hidden_spikes==0] += 0.002
+                input_hidden_sg.vars["g"].push_to_device()
+
+def evaluate_genn(raw_data, network, 
+                  input, hidden, output, 
+                  sensor_size, ordering, plot):
     # Preprocess
     spikes = []
     labels = []
-    for i in range(NUM_TEST_SAMPLES):
-        events, label = dataset[i]
-        spikes.append(preprocess_tonic_spikes(events, dataset.ordering,
-                                              dataset.sensor_size))
+    for events, label in raw_data:
+        spikes.append(preprocess_tonic_spikes(events, ordering,
+                                              sensor_size, dt=DT,
+                                              histogram_thresh=1))
         labels.append(label)
     
     compiler = InferenceCompiler(evaluate_timesteps=MAX_TIMESTEPS,
@@ -92,7 +235,7 @@ def evaluate_genn(dataset, network, input, hidden, output, plot):
                                                   {output: labels},
                                                   callbacks=callbacks)
 
-        print(f"GeNN test accuracy = {100 * metrics[output].result}%")
+        print(f"GeNN test accuracy: {100 * metrics[output].result}%")
         
         if plot:
             fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
@@ -103,15 +246,14 @@ def evaluate_genn(dataset, network, input, hidden, output, plot):
             axes[0, 0].set_ylabel("Hidden neuron ID")
             axes[1, 0].set_ylabel("Output voltage")
 
-def evaluate_lava(dataset, net_x_filename, plot):
+def evaluate_lava(raw_data, net_x_filename, 
+                  sensor_size, num_classes, plot):
     # Preprocess
-    num_input, num_output = get_dataset_num_in_out(dataset)
-    transform = ToFrame(sensor_size=SHD.sensor_size, time_window=1000.0)
+    num_input = int(np.prod(sensor_size))
+    transform = ToFrame(sensor_size=sensor_size, time_window=1000.0)
     tensors = []
     labels = []
-    for i in range(NUM_TEST_SAMPLES):
-        events, label = dataset[i]
-
+    for events, label in raw_data:
         # Transform events to tensor
         tensor = transform(events)
         assert tensor.shape[-1] < MAX_TIMESTEPS
@@ -152,7 +294,7 @@ def evaluate_lava(dataset, net_x_filename, plot):
 
     # Get output and reshape
     output_v = monitor_output.get_data()["neuron"]["v"]
-    output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, num_output))
+    output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, num_classes))
 
     # For each example, sum output neuron voltage over time
     sum_v = np.sum(output_v, axis=1)
@@ -180,20 +322,34 @@ def evaluate_lava(dataset, net_x_filename, plot):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Get SHD dataset
-    dataset = SHD(save_to='../data', train=False)
+    # Get SHD data
+    if TRAIN:
+        raw_train_data, sensor_size, ordering, num_classes = load_data(True)
+        raw_test_data, _, _, _ = load_data(False, NUM_TEST_SAMPLES)
+    else:
+        raw_test_data, sensor_size, ordering, num_classes = load_data(False, NUM_TEST_SAMPLES)
 
     # Build suitable mlGeNN model
-    network, input, hidden, output = build_ml_genn_model(dataset)
-
+    network, input, hidden, output, input_hidden = build_ml_genn_model(sensor_size, num_classes)
+    
+    serialiser = Numpy("shd_checkpoints")
+    
+    if TRAIN:
+        train_genn(raw_train_data, network, serialiser,
+                   input, hidden, output, input_hidden,
+                   sensor_size, ordering)
+    
     # Evaluate in GeNN
-    evaluate_genn(dataset, network, input, hidden, output, PLOT)
+    network.load((NUM_EPOCHS - 1,), serialiser)
+    evaluate_genn(raw_test_data, network, 
+                  input, hidden, output, 
+                  sensor_size, ordering, PLOT)
 
     # Export to netx
-    export("shd.net", input, output, dt=DT)
+    #export("shd.net", input, output, dt=DT)
 
     # Evaluate in Lava
-    evaluate_lava(dataset, "shd.net", PLOT)
+    #evaluate_lava(raw_test_data, "shd.net", PLOT)
 
     plt.show()
 
