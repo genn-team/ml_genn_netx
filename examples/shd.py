@@ -296,8 +296,11 @@ def evaluate_lava(raw_data, net_x_filename,
     output_v = monitor_output.get_data()["neuron"]["v"]
     output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, num_classes))
 
-    # For each example, sum output neuron voltage over time
-    sum_v = np.sum(output_v, axis=1)
+    # Calculate output weighting
+    output_weighting = np.exp(-np.arange(MAX_TIMESTEPS) / MAX_TIMESTEPS)
+
+    # For each example, sum weighted output neuron voltage over time
+    sum_v = np.sum(output_v * output_weighting[np.newaxis,:,np.newaxis], axis=1)
 
     # Find maximum output neuron voltage and compare to label
     pred = np.argmax(sum_v, axis=1)
