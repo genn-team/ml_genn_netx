@@ -29,9 +29,9 @@ from ml_genn.compilers.event_prop_compiler import default_params
 
 NUM_HIDDEN = 1024
 BATCH_SIZE = 32
-NUM_EPOCHS = 50
+NUM_EPOCHS = 21
 DT = 1.0
-TRAIN = True
+TRAIN = False
 PLOT = False
 KERNEL_PROFILING = True
 NUM_TEST_SAMPLES = 200
@@ -346,10 +346,10 @@ if __name__ == "__main__":
                   sensor_size, ordering, PLOT)
 
     # Export to netx
-    #export("shd.net", input, output, dt=DT)
+    export("shd.net", input, output, dt=DT)
 
     # Evaluate in Lava
-    #evaluate_lava(raw_test_data, "shd.net", PLOT)
+    evaluate_lava(raw_test_data, "shd.net", sensor_size, num_classes, PLOT)
 
     plt.show()
 
