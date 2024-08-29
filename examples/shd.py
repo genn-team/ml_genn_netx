@@ -20,18 +20,19 @@ from ml_genn.synapses import Exponential
 from tonic.datasets import SHD
 from tonic.transforms import CropTime, ToFrame
 
-from copy import deepcopy
+from copy import copy
 from ml_genn.utils.data import preprocess_tonic_spikes
 from ml_genn_netx import export
+from random import choice
 from tqdm import tqdm
 
 from ml_genn.compilers.event_prop_compiler import default_params
 
 NUM_HIDDEN = 1024
 BATCH_SIZE = 32
-NUM_EPOCHS = 21
+NUM_EPOCHS = 50
 DT = 1.0
-TRAIN = False
+TRAIN = True
 PLOT = False
 KERNEL_PROFILING = True
 NUM_TEST_SAMPLES = 200
@@ -39,19 +40,16 @@ MAX_TIMESTEPS = 1000
 
 
 class EaseInSchedule(Callback):
-    def __init__(self):
-        pass
-
     def set_params(self, compiled_network, **kwargs):
-        self._optimisers = [optimiser[0] for optimiser in compiled_network.optimisers[:3]]
+        self._optimisers = [o for o, _ in compiled_network.optimisers]
 
     def on_batch_begin(self, batch):
         # Set parameter to return value of function
-        for optimiser in self._optimisers:
-            if optimiser.alpha < 0.001 :
-                optimiser.alpha = (0.001 / 1000.0) * (1.05 ** batch)
+        for o in self._optimisers:
+            if o.alpha < 0.001 :
+                o.alpha = (0.001 / 1000.0) * (1.05 ** batch)
             else:
-                optimiser.alpha = 0.001
+                o.alpha = 0.001
 
 
 class Shift:
@@ -60,9 +58,9 @@ class Shift:
         self.sensor_size = sensor_size
 
     def __call__(self, events: np.ndarray) -> np.ndarray:
-        # Shift events
-        events_copy = deepcopy(events)
-        events_copy["x"] = events_copy["x"] + np.random.randint(-self.f_shift, self.f_shift)
+        # Copy events and shift in space by random amount
+        events_copy = events.copy()
+        events_copy["x"] += np.random.randint(-self.f_shift, self.f_shift)
 
         # Delete out of bound events
         events_copy = np.delete(
@@ -73,23 +71,36 @@ class Shift:
 
 
 class Blend:
-    def __init__(self, p_blend, sensor_size):
+    def __init__(self, p_blend, sensor_size, n_blend=7644):
         self.p_blend = p_blend
-        self.n_blend = 7644
+        self.n_blend = n_blend
         self.sensor_size = sensor_size
 
     def __call__(self, dataset: list, classes: list) -> list:
-        for i in range(self.n_blend):
-            idx = np.random.randint(0,len(dataset))
-            idx2 = np.random.randint(0,len(classes[dataset[idx][1]]))
-            assert dataset[idx][1] == dataset[classes[dataset[idx][1]][idx2]][1]
-            dataset.append((self.blend(dataset[idx][0], dataset[classes[dataset[idx][1]][idx2]][0]), dataset[idx][1]))
+        # Start with (shallow) copy of original dataset
+        blended_dataset = copy(dataset)
 
-        return dataset
+        # Loop through number of blends to add
+        for i in range(self.n_blend):
+            # Pick random example
+            idx = np.random.randint(0, len(dataset))
+            example_spikes, example_label = dataset[idx]
+            
+            # Pick another from same class
+            idx2 = np.random.randint(0, len(classes[example_label]))
+            blend_spikes, blend_label = dataset[classes[example_label][idx2]]
+            assert blend_label == example_label
+            
+            # Blend together to form new dataset
+            blended_dataset.append((self.blend(example_spikes, blend_spikes),
+                                    example_label))
+
+        return blended_dataset
 
     def blend(self, X1, X2):
-        X1 = deepcopy(X1)
-        X2 = deepcopy(X2)
+        # Copy spike arrays and align centres of mass in space and time
+        X1 = X1.copy()
+        X2 = X2.copy()
         mx1 = np.mean(X1["x"])
         mx2 = np.mean(X2["x"])
         mt1 = np.mean(X1["t"])
@@ -98,27 +109,32 @@ class Blend:
         X2["x"]+= int((mx1-mx2)/2)
         X1["t"]+= int((mt2-mt1)/2)
         X2["t"]+= int((mt1-mt2)/2)
-        max_t = MAX_TIMESTEPS * 1000.0
+
+        # Delete any spikes that are out of bounds in space or time
+        max_t = MAX_TIMESTEPS * DT * 1000.0
         X1 = np.delete(
-            X1,
-            np.where(
-                (X1["x"] < 0) | (X1["x"] >= self.sensor_size[0]) | (X1["t"] < 0) | (X1["t"] >= max_t)))
+            X1, np.where((X1["x"] < 0) | (X1["x"] >= self.sensor_size[0])
+                         | (X1["t"] < 0) | (X1["t"] >= max_t)))
         X2 = np.delete(
-            X2,
-            np.where(
-                (X2["x"] < 0) | (X2["x"] >= self.sensor_size[0]) | (X2["t"] < 0) | (X2["t"] >= max_t)))
+            X2, np.where((X2["x"] < 0) | (X2["x"] >= self.sensor_size[0]) 
+                         | (X2["t"] < 0) | (X2["t"] >= max_t)))
+
+        # Combine random blended subset of spikes
         mask1 = np.random.rand(X1["x"].shape[0]) < self.p_blend
-        mask2 = np.random.rand(X2["x"].shape[0]) < self.p_blend
-        X1_X2 = np.concatenate([X1[mask1], X2[mask2]])
-        idx= np.argsort(X1_X2["t"])
+        mask2 = np.random.rand(X2["x"].shape[0]) < (1.0 - self.p_blend)
+        X1_X2 = np.concatenate((X1[mask1], X2[mask2]))
+
+        # Resort and return
+        idx = np.argsort(X1_X2["t"])
         X1_X2 = X1_X2[idx]
         return X1_X2
 
 def load_data(train, num=None):
-    # Get SHD dataset
-    dataset = SHD(save_to='../data', train=train,
-                  transform=CropTime(max=MAX_TIMESTEPS * 1000.0))
-    
+    # Get SHD dataset, cropped to maximum timesteps (in us)
+    dataset = SHD(save_to="../data", train=train,
+                  transform=CropTime(max=MAX_TIMESTEPS * DT * 1000.0))
+
+    # Get raw event data
     raw_data = []
     for i in range(num if num is not None else len(dataset)):
         raw_data.append(dataset[i])
@@ -149,22 +165,22 @@ def build_ml_genn_model(sensor_size, num_classes):
 
     return network, input, hidden, output, input_hidden
 
-def train_genn(raw_data, network, serialiser,
+def train_genn(raw_dataset, network, serialiser,
                input, hidden, output, input_hidden,
                sensor_size, ordering):
     # Create EventProp compiler
     compiler = EventPropCompiler(example_timesteps=MAX_TIMESTEPS,
-                                losses="sparse_categorical_crossentropy",
-                                reg_lambda_upper=5e-11, reg_lambda_lower=5e-11, 
-                                reg_nu_upper=14, max_spikes=1500, 
-                                optimiser=Adam(0.001 * 0.01), batch_size=BATCH_SIZE)
+                                 losses="sparse_categorical_crossentropy",
+                                 reg_lambda_upper=5e-11, reg_lambda_lower=5e-11, 
+                                 reg_nu_upper=14, max_spikes=1500, 
+                                 optimiser=Adam(0.001 / 1000.0), batch_size=BATCH_SIZE)
     # Create augmentation objects
     shift = Shift(40.0, sensor_size)
     blend = Blend(0.5, sensor_size)
 
     # Build classes list
     classes = [[] for _ in range(np.prod(output.shape))]
-    for i, (_, label) in enumerate(raw_data):
+    for i, (_, label) in enumerate(raw_dataset):
         classes[label].append(i)
     
     # Compile network
@@ -175,13 +191,12 @@ def train_genn(raw_data, network, serialiser,
         callbacks = [Checkpoint(serialiser), EaseInSchedule(),
                      SpikeRecorder(hidden, key="hidden_spikes",
                                    record_counts=True)]
-        
         # Loop through epochs
         for e in range(NUM_EPOCHS):
             # Apply augmentation to events and preprocess
             spikes_train = []
             labels_train = []
-            blended_dataset = blend(raw_data, classes)
+            blended_dataset = blend(raw_dataset, classes)
             for events, label in blended_dataset:
                 spikes_train.append(preprocess_tonic_spikes(shift(events), ordering,
                                                             sensor_size, dt=DT,
@@ -208,13 +223,13 @@ def train_genn(raw_data, network, serialiser,
                 g_view[:,hidden_spikes==0] += 0.002
                 input_hidden_sg.vars["g"].push_to_device()
 
-def evaluate_genn(raw_data, network, 
+def evaluate_genn(raw_dataset, network, 
                   input, hidden, output, 
                   sensor_size, ordering, plot):
     # Preprocess
     spikes = []
     labels = []
-    for events, label in raw_data:
+    for events, label in raw_dataset:
         spikes.append(preprocess_tonic_spikes(events, ordering,
                                               sensor_size, dt=DT,
                                               histogram_thresh=1))
@@ -246,14 +261,14 @@ def evaluate_genn(raw_data, network,
             axes[0, 0].set_ylabel("Hidden neuron ID")
             axes[1, 0].set_ylabel("Output voltage")
 
-def evaluate_lava(raw_data, net_x_filename, 
+def evaluate_lava(raw_dataset, net_x_filename, 
                   sensor_size, num_classes, plot):
     # Preprocess
     num_input = int(np.prod(sensor_size))
     transform = ToFrame(sensor_size=sensor_size, time_window=1000.0)
     tensors = []
     labels = []
-    for events, label in raw_data:
+    for events, label in raw_dataset:
         # Transform events to tensor
         tensor = transform(events)
         assert tensor.shape[-1] < MAX_TIMESTEPS
