@@ -4,10 +4,14 @@ import mnist
 import lava.lib.dl.netx as netx
 import logging
 
-from lava.magma.core.run_configs import Loihi2SimCfg
+from lava.magma.core.run_configs import Loihi2SimCfg, Loihi2HwCfg
 from lava.magma.core.run_conditions import RunSteps
+from lava.proc.cyclic_buffer.process import CyclicBuffer
 from lava.proc.io.source import RingBuffer as SourceRingBuffer
 from lava.proc.monitor.process import Monitor
+from lava.utils.loihi2_state_probes import StateProbe
+from lava.utils.system import Loihi2
+
 from ml_genn import Connection, Network, Population
 from ml_genn.callbacks import Callback, Checkpoint, SpikeRecorder, VarRecorder
 from ml_genn.compilers import EventPropCompiler, InferenceCompiler
@@ -17,6 +21,7 @@ from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, SpikeInput
 from ml_genn.optimisers import Adam
 from ml_genn.serialisers import Numpy
 from ml_genn.synapses import Exponential
+
 from tonic.datasets import SHD
 from tonic.transforms import CropTime, ToFrame
 
@@ -28,13 +33,14 @@ from tqdm import tqdm
 
 from ml_genn.compilers.event_prop_compiler import default_params
 
-NUM_HIDDEN = 1024
+NUM_HIDDEN = 256
 BATCH_SIZE = 32
 NUM_EPOCHS = 50
-DT = 1.0
+DT = 2.0
 TRAIN = True
 PLOT = False
-KERNEL_PROFILING = True
+DEVICE = False
+KERNEL_PROFILING = False
 NUM_TEST_SAMPLES = 200
 MAX_TIMESTEPS = 1000
 
@@ -85,7 +91,7 @@ class Blend:
             # Pick random example
             idx = np.random.randint(0, len(dataset))
             example_spikes, example_label = dataset[idx]
-            
+           
             # Pick another from same class
             idx2 = np.random.randint(0, len(classes[example_label]))
             blend_spikes, blend_label = dataset[classes[example_label][idx2]]
@@ -260,9 +266,9 @@ def evaluate_genn(raw_dataset, network,
             
             axes[0, 0].set_ylabel("Hidden neuron ID")
             axes[1, 0].set_ylabel("Output voltage")
-
+ 
 def evaluate_lava(raw_dataset, net_x_filename, 
-                  sensor_size, num_classes, plot):
+                  sensor_size, num_classes, plot, device):
     # Preprocess
     num_input = int(np.prod(sensor_size))
     transform = ToFrame(sensor_size=sensor_size, time_window=1000.0)
@@ -281,6 +287,7 @@ def evaluate_lava(raw_dataset, net_x_filename,
     # Stack tensors
     tensors = np.hstack(tensors)
 
+    # **TODO** MAX_TIMESTEPS should be maximum of 256 and P.O.T.
     network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=MAX_TIMESTEPS)
 
     # **TODO** move to recurrent unit test
@@ -289,26 +296,50 @@ def evaluate_lava(raw_dataset, net_x_filename,
     assert type(network_lava.layers[0]) == netx.blocks.process.RecurrentDense
     assert type(network_lava.layers[1]) == netx.blocks.process.Dense
 
-    # Create source ring buffer to deliver input spike tensors and connect to network input port
-    input_lava = SourceRingBuffer(data=tensors)
-    input_lava.s_out.connect(network_lava.inp)
+    if device:
+        first_tensor = tensors[:,0]
+        ro_tensors = tensors[:,1:]
+        input = CyclicBuffer(first_frame=first_tensor, replay_frames=ro_tensors)
+        
+        probe_output_v = StateProbe(network_lava.layers[-1].neuron.v)
+        
+        run_config = Loihi2HwCfg(callback_fxs=[probe_output_v])
+        
+        if Loihi2.is_loihi2_available:
+            print(f'Running on {Loihi2.partition}')
+            from lava.utils import loihi2_profiler
+        else:
+            RuntimeError("Loihi2 compiler is not available in this system. "
+                        "This tutorial cannot proceed further.")
+        
+        # Run model for each test sample
+        for _ in tqdm(range(NUM_TEST_SAMPLES)):
+            network_lava.run(condition=RunSteps(num_steps=MAX_TIMESTEPS), run_cfg=run_config)
 
-    # Create monitor to record output voltages (shape is total timesteps)
-    monitor_output = Monitor()
-    monitor_output.probe(network_lava.layers[-1].neuron.v, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
+        output_v = probe_output_v.time_series.reshape(num_classes, MAX_TIMESTEPS * NUM_TEST_SAMPLES).T
+    else:
+        # Create source ring buffer to deliver input spike tensors and connect to network input port
+        input_lava = SourceRingBuffer(data=tensors)
+        input_lava.s_out.connect(network_lava.inp)
 
-    if plot:
-        monitor_hidden = Monitor()
-        monitor_hidden.probe(network_lava.layers[0].neuron.s_out, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
+        # Create monitor to record output voltages (shape is total timesteps)
+        monitor_output = Monitor()
+        monitor_output.probe(network_lava.layers[-1].neuron.v, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
 
-    run_config = Loihi2SimCfg(select_tag="fixed_pt")
+        if plot:
+            monitor_hidden = Monitor()
+            monitor_hidden.probe(network_lava.layers[0].neuron.s_out, NUM_TEST_SAMPLES * MAX_TIMESTEPS)
 
-    # Run model for each test sample
-    for _ in tqdm(range(NUM_TEST_SAMPLES)):
-        network_lava.run(condition=RunSteps(num_steps=MAX_TIMESTEPS), run_cfg=run_config)
+        run_config = Loihi2SimCfg(select_tag="fixed_pt")
 
-    # Get output and reshape
-    output_v = monitor_output.get_data()["neuron"]["v"]
+        # Run model for each test sample
+        for _ in tqdm(range(NUM_TEST_SAMPLES)):
+            network_lava.run(condition=RunSteps(num_steps=MAX_TIMESTEPS), run_cfg=run_config)
+
+        # Get output
+        output_v = monitor_output.get_data()["neuron"]["v"]
+    
+    
     output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, num_classes))
 
     # Calculate output weighting
@@ -367,7 +398,7 @@ if __name__ == "__main__":
     export("shd.net", input, output, dt=DT)
 
     # Evaluate in Lava
-    evaluate_lava(raw_test_data, "shd.net", sensor_size, num_classes, PLOT)
+    evaluate_lava(raw_test_data, "shd.net", sensor_size, num_classes, PLOT, DEVICE)
 
     plt.show()
 
