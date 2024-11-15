@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import mnist
 import lava.lib.dl.netx as netx
 import logging
+import os
 
 from lava.magma.core.run_configs import Loihi2SimCfg, Loihi2HwCfg
 from lava.magma.core.run_conditions import RunSteps
@@ -33,16 +34,16 @@ from tqdm import tqdm
 
 from ml_genn.compilers.event_prop_compiler import default_params
 
-NUM_HIDDEN = 256
-BATCH_SIZE = 32
+NUM_HIDDEN = 1024
+BATCH_SIZE = 1
 NUM_EPOCHS = 50
-DT = 2.0
-TRAIN = True
-PLOT = False
-DEVICE = False
+DT = 1.0
+TRAIN = False
+PLOT = True
+DEVICE = True
 KERNEL_PROFILING = False
-NUM_TEST_SAMPLES = 200
-MAX_TIMESTEPS = 1000
+NUM_TEST_SAMPLES = 2
+MAX_TIMESTEPS = 1024
 
 
 class EaseInSchedule(Callback):
@@ -269,27 +270,34 @@ def evaluate_genn(raw_dataset, network,
  
 def evaluate_lava(raw_dataset, net_x_filename, 
                   sensor_size, num_classes, plot, device):
+    os.environ["PATH"] += ":/nfs/ncl/bin:"
+    os.environ["PARTITION"] = "oheogulch_20m" # _20m _2h (if 2 hours are needed)                              
+    os.environ['SLURM'] = '1'
+    os.environ['LOIHI_GEN'] = 'N3C1'
+
     # Preprocess
     num_input = int(np.prod(sensor_size))
-    transform = ToFrame(sensor_size=sensor_size, time_window=1000.0)
+    transform = ToFrame(sensor_size=sensor_size, time_window=1000.0*DT) 
     tensors = []
     labels = []
     for events, label in raw_dataset:
         # Transform events to tensor
         tensor = transform(events)
-        assert tensor.shape[-1] < MAX_TIMESTEPS
+        assert tensor.shape[0] < MAX_TIMESTEPS 
 
         # Transpose tensor and pad time to max
+        print(f"MAX_TIMESTEPS: {MAX_TIMESTEPS}, tensor.shape[0]: {tensor.shape[0]}")
         tensors.append(np.pad(np.reshape(np.transpose(tensor), (num_input, -1)),
                               ((0, 0), (0, MAX_TIMESTEPS - tensor.shape[0]))))
         labels.append(label)
 
     # Stack tensors
-    tensors = np.hstack(tensors)
+    tensors = np.hstack(tensors).astype(np.int8)
 
     # **TODO** MAX_TIMESTEPS should be maximum of 256 and P.O.T.
-    network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=MAX_TIMESTEPS)
-
+    print(f"MAX_TIMESTEPS: {MAX_TIMESTEPS}")
+    network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=MAX_TIMESTEPS, input_message_bits=8)
+    network_lava._log_config.level = logging.INFO
     # **TODO** move to recurrent unit test
     assert network_lava.input_shape == (num_input,)
     assert len(network_lava) == 2
@@ -299,7 +307,8 @@ def evaluate_lava(raw_dataset, net_x_filename,
     if device:
         first_tensor = tensors[:,0]
         ro_tensors = tensors[:,1:]
-        input = CyclicBuffer(first_frame=first_tensor, replay_frames=ro_tensors)
+        input_lava = CyclicBuffer(first_frame=first_tensor, replay_frames=ro_tensors)
+        input_lava.s_out.connect(network_lava.inp)
         
         probe_output_v = StateProbe(network_lava.layers[-1].neuron.v)
         
@@ -351,19 +360,19 @@ def evaluate_lava(raw_dataset, net_x_filename,
     # Find maximum output neuron voltage and compare to label
     pred = np.argmax(sum_v, axis=1)
     good = np.sum(pred == labels)
-
+    print(f"pred: {pred}, labels: {labels}")
     print(f"Lava test accuracy: {good/NUM_TEST_SAMPLES*100}%")
     if plot:
-        hidden_spikes = monitor_hidden.get_data()["neuron"]["s_out"]
-        hidden_spikes = np.reshape(hidden_spikes, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
+        #hidden_spikes = monitor_hidden.get_data()["neuron"]["s_out"]
+        #hidden_spikes = np.reshape(hidden_spikes, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
         
         fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
         for a in range(NUM_TEST_SAMPLES):
-            sample_hidden_spikes = np.where(hidden_spikes[a,:,:] > 0.0)
-            axes[0, a].scatter(sample_hidden_spikes[0], sample_hidden_spikes[1], s=1)
+            #sample_hidden_spikes = np.where(hidden_spikes[a,:,:] > 0.0)
+            #axes[0, a].scatter(sample_hidden_spikes[0], sample_hidden_spikes[1], s=1)
             axes[1, a].plot(output_v[a,:,:])
         
-        axes[0,0].set_ylabel("Hidden neuron ID")
+        #axes[0,0].set_ylabel("Hidden neuron ID")
         axes[1,0].set_ylabel("Output voltage")
 
     network_lava.stop()
@@ -381,7 +390,7 @@ if __name__ == "__main__":
     # Build suitable mlGeNN model
     network, input, hidden, output, input_hidden = build_ml_genn_model(sensor_size, num_classes)
     
-    serialiser = Numpy("shd_checkpoints")
+    serialiser = Numpy("shd_checkpoints_thomas")
     
     if TRAIN:
         train_genn(raw_train_data, network, serialiser,
