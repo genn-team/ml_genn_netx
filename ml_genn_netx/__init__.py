@@ -110,18 +110,24 @@ def _get_network_dag(inputs, outputs):
     # Zip DAG back together with recurrentness 
     return list(zip(dag, recurrent))
 
-def _get_weight_scale(neuron: Neuron, shape, dt: float):
+def _get_weight_scale(neuron: Neuron, synapse: Synapse,
+                      shape, dt: float):
     # If neuron model has leak
+    weight_scale = 1.0
     if isinstance(neuron, (LeakyIntegrateFire, LeakyIntegrate)):
-        # Ensure we have an array of tau values
-        tau_mem = _check_param(neuron.tau_mem, shape)
-
-        # Calculate decays and convert to fixed point
-        v_alpha = 1.0 - np.exp(-dt / tau_mem)
-        
-        return v_alpha if neuron.scale_i else 1.0
-    else:
-        return 1.0
+        # If it scales I, multiply weight scale by additional 
+        # decay GeNN neuron applies to incoming current
+        if neuron.scale_i:
+            tau_mem = _check_param(neuron.tau_mem, shape)
+            weight_scale *= 1.0 - np.exp(-dt / tau_mem)
+    
+    # If synapse model is exponential and scales i, multiply weight scale
+    # by additional factor GeNN uses to improve match with exact solution
+    if isinstance(synapse, Exponential) and synapse.scale_i:
+        tau_syn = _check_param(synapase.tau, shape)
+        weight_scale *= (tau_syn / dt) * (1.0 - np.exp(-dt / tau_syn))
+    
+    return weight_scale
 
 
 def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]], 
@@ -254,7 +260,8 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
 
     # Due to implementation details, weights need scaling to 
     # match some mlGeNN neuron types so calculate first
-    weight_scale = _get_weight_scale(pop.neuron, pop.shape, dt)
+    weight_scale = _get_weight_scale(pop.neuron, con.synapse,
+                                     pop.shape, dt)
 
     # Convert weights to NetX format
     num_src = np.prod(con.source().shape)
@@ -311,7 +318,8 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
 
     # Due to implementation details, weights need scaling to 
     # match some mlGeNN neuron types so calculate first
-    weight_scale = _get_weight_scale(pop.neuron, pop.shape, dt)
+    weight_scale = _get_weight_scale(pop.neuron, con.synapse,
+                                     pop.shape, dt)
 
     # Convert weights to NetX format
     num_src = np.prod(ff_con.source().shape)
