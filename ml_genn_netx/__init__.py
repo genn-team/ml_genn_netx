@@ -124,7 +124,7 @@ def _get_weight_scale(neuron: Neuron, synapse: Synapse,
     # If synapse model is exponential and scales i, multiply weight scale
     # by additional factor GeNN uses to improve match with exact solution
     if isinstance(synapse, Exponential) and synapse.scale_i:
-        tau_syn = _check_param(synapase.tau, shape)
+        tau_syn = _check_param(synapse.tau, shape)
         weight_scale *= (tau_syn / dt) * (1.0 - np.exp(-dt / tau_syn))
     
     return weight_scale
