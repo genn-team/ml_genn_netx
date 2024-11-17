@@ -318,7 +318,7 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
 
     # Due to implementation details, weights need scaling to 
     # match some mlGeNN neuron types so calculate first
-    weight_scale = _get_weight_scale(pop.neuron, con.synapse,
+    weight_scale = _get_weight_scale(pop.neuron, rec_con.synapse,
                                      pop.shape, dt)
 
     # Convert weights to NetX format
