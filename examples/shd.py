@@ -40,9 +40,9 @@ NUM_EPOCHS = 50
 DT = 1.0
 TRAIN = False
 PLOT = True
-DEVICE = True
+DEVICE = False
 KERNEL_PROFILING = False
-NUM_TEST_SAMPLES = 2
+NUM_TEST_SAMPLES = 1
 MAX_TIMESTEPS = 1024
 
 
@@ -260,16 +260,20 @@ def evaluate_genn(raw_dataset, network,
         print(f"GeNN test accuracy: {100 * metrics[output].result}%")
         
         if plot:
-            fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
+            fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row", squeeze=False)
             for a in range(NUM_TEST_SAMPLES):
-                axes[0, a].scatter(cb_data["hidden_spikes"][0][a], cb_data["hidden_spikes"][1][a], s=1)
+                if NUM_TEST_SAMPLES > 1:
+                    axes[0, a].scatter(cb_data["hidden_spikes"][0][a], cb_data["hidden_spikes"][1][a], s=1)
+                else:
+                    axes[0,a].scatter(cb_data["hidden_spikes"][0], cb_data["hidden_spikes\
+"][1], s=1)
                 axes[1, a].plot(cb_data["output_v"][a])
-            
             axes[0, 0].set_ylabel("Hidden neuron ID")
             axes[1, 0].set_ylabel("Output voltage")
- 
+                
 def evaluate_lava(raw_dataset, net_x_filename, 
                   sensor_size, num_classes, plot, device):
+    #logging.basicConfig(level=logging.INFO)
     os.environ["PATH"] += ":/nfs/ncl/bin:"
     os.environ["PARTITION"] = "oheogulch_20m" # _20m _2h (if 2 hours are needed)                              
     os.environ['SLURM'] = '1'
@@ -296,7 +300,10 @@ def evaluate_lava(raw_dataset, net_x_filename,
 
     # **TODO** MAX_TIMESTEPS should be maximum of 256 and P.O.T.
     print(f"MAX_TIMESTEPS: {MAX_TIMESTEPS}")
-    network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=MAX_TIMESTEPS, input_message_bits=8)
+    if not device:
+        network_lava = netx.hdf5.Network(net_config="shd.net", reset_interval=MAX_TIMESTEPS)
+    else:
+        network_lava = netx.hdf5.Network(net_config="shd.net", input_message_bits=8)
     network_lava._log_config.level = logging.INFO
     # **TODO** move to recurrent unit test
     assert network_lava.input_shape == (num_input,)
@@ -309,10 +316,10 @@ def evaluate_lava(raw_dataset, net_x_filename,
         ro_tensors = tensors[:,1:]
         input_lava = CyclicBuffer(first_frame=first_tensor, replay_frames=ro_tensors)
         input_lava.s_out.connect(network_lava.inp)
-        
+        #input_lava.s_out.connect(network_lava.layers[0].synapse.s_in)
         probe_output_v = StateProbe(network_lava.layers[-1].neuron.v)
-        
-        run_config = Loihi2HwCfg(callback_fxs=[probe_output_v])
+        probe_hidden_v = StateProbe(network_lava.layers[0].neuron.v)
+        run_config = Loihi2HwCfg(callback_fxs=[probe_output_v,probe_hidden_v])
         
         if Loihi2.is_loihi2_available:
             print(f'Running on {Loihi2.partition}')
@@ -323,9 +330,15 @@ def evaluate_lava(raw_dataset, net_x_filename,
         
         # Run model for each test sample
         for _ in tqdm(range(NUM_TEST_SAMPLES)):
-            network_lava.run(condition=RunSteps(num_steps=MAX_TIMESTEPS), run_cfg=run_config)
-
+            network_lava.run(condition=RunSteps(num_steps=MAX_TIMESTEPS), run_cfg=run_config)   
+            # reset the voltage after each trial
+            network_lava.layers[0].neuron.v.set(np.zeros((NUM_HIDDEN,), dtype = np.int32))
+            network_lava.layers[0].neuron.u.set(np.zeros((NUM_HIDDEN,), dtype = np.int32))
+            network_lava.layers[1].neuron.v.set(np.zeros((num_classes,), dtype = np.int32))
+            network_lava.layers[1].neuron.u.set(np.zeros((num_classes,), dtype = np.int32))
+        
         output_v = probe_output_v.time_series.reshape(num_classes, MAX_TIMESTEPS * NUM_TEST_SAMPLES).T
+        hidden_v = probe_hidden_v.time_series.reshape(NUM_HIDDEN, MAX_TIMESTEPS * NUM_TEST_SAMPLES).T
     else:
         # Create source ring buffer to deliver input spike tensors and connect to network input port
         input_lava = SourceRingBuffer(data=tensors)
@@ -350,6 +363,8 @@ def evaluate_lava(raw_dataset, net_x_filename,
     
     
     output_v = np.reshape(output_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, num_classes))
+    if device:
+        hidden_v = np.reshape(hidden_v, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
 
     # Calculate output weighting
     output_weighting = np.exp(-np.arange(MAX_TIMESTEPS) / MAX_TIMESTEPS)
@@ -363,16 +378,19 @@ def evaluate_lava(raw_dataset, net_x_filename,
     print(f"pred: {pred}, labels: {labels}")
     print(f"Lava test accuracy: {good/NUM_TEST_SAMPLES*100}%")
     if plot:
-        #hidden_spikes = monitor_hidden.get_data()["neuron"]["s_out"]
-        #hidden_spikes = np.reshape(hidden_spikes, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
+        if not device:
+            hidden_spikes = monitor_hidden.get_data()["neuron"]["s_out"]
+            hidden_spikes = np.reshape(hidden_spikes, (NUM_TEST_SAMPLES, MAX_TIMESTEPS, NUM_HIDDEN))
         
-        fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row")
+        fig, axes = plt.subplots(2, NUM_TEST_SAMPLES, sharex="col", sharey="row", squeeze=False)
         for a in range(NUM_TEST_SAMPLES):
-            #sample_hidden_spikes = np.where(hidden_spikes[a,:,:] > 0.0)
-            #axes[0, a].scatter(sample_hidden_spikes[0], sample_hidden_spikes[1], s=1)
+            if not device:
+                sample_hidden_spikes = np.where(hidden_spikes[a,:,:] > 0.0)
+                axes[0, a].scatter(sample_hidden_spikes[0], sample_hidden_spikes[1], s=1)
+            else:
+                axes[0, a].plot(hidden_v[a,:,:5])
             axes[1, a].plot(output_v[a,:,:])
-        
-        #axes[0,0].set_ylabel("Hidden neuron ID")
+        axes[0,0].set_ylabel("Hidden neuron ID")
         axes[1,0].set_ylabel("Output voltage")
 
     network_lava.stop()
@@ -404,7 +422,7 @@ if __name__ == "__main__":
                   sensor_size, ordering, PLOT)
 
     # Export to netx
-    export("shd.net", input, output, dt=DT)
+    export("shd.net", input, output, dt=DT,num_weight_bits=8)
 
     # Evaluate in Lava
     evaluate_lava(raw_test_data, "shd.net", sensor_size, num_classes, PLOT, DEVICE)
