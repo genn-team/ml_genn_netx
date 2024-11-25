@@ -213,7 +213,7 @@ def _export_neuron(layer_group: h5py.Group, shape, dt: float,
         # Otherwise, set extremely high threshold
         # **YUCK** this also isn't ideal
         else:
-            v_thresh_fixed_point = 2**17
+            v_thresh_fixed_point = 2**16
             ref_delay = 0
 
         logger.info(f"\tNeuron membrane decay {v_alpha_fixed_point}")
