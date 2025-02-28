@@ -139,7 +139,7 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
     # **NOTE** weight scale may be a scalar or num_trg long vector
     weights = [(np.reshape(w, (s, t)) * weight_scale, s, t)
                 for w, s, t in weights]
-    
+
     # Flatten and concatenate weights and find scaling factors
     weights_concat = np.concatenate([w.flatten() for w, _, _ in weights])
     min_quant, max_quant, scale = _find_signed_scale(weights_concat, num_bits,
@@ -165,8 +165,8 @@ def _get_netx_delays(delay: InitValue, num_src: int, num_trg: int):
         if is_delay_array:
             delay = np.reshape(delay, (num_src, num_trg))
         
-        # Convert to integer
-        delay = np.rint(delay).astype(int)
+        # Take transpose and convert to integer
+        delay = np.rint(np.transpose(delay)).astype(int)
         if np.any((delay < 0) | (delay >= 62)):
             logger.warn("\tFor Loihi delays must be between 0 and 62")
         return delay
@@ -298,7 +298,7 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
     # Add delays
     delays = _get_netx_delays(con.connectivity.delay, num_src, num_trg)
     if delays is not None:
-        layer_group.create_dataset("delays", data=delays, dtype="i4")
+        layer_group.create_dataset("delay", data=delays, dtype="i4")
     
     # Export neuron model
     _export_neuron(layer_group, pop.shape, dt, quant_scale,
@@ -365,12 +365,12 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
     # Add feedforward delays
     delays = _get_netx_delays(ff_con.connectivity.delay, num_src, num_trg)
     if delays is not None:
-        layer_group.create_dataset("delays", data=delays, dtype="i4")
+        layer_group.create_dataset("delay", data=delays, dtype="i4")
     
     # Add recurrent delays
     delays_rec = _get_netx_delays(rec_con.connectivity.delay, num_trg, num_trg)
     if delays_rec is not None:
-        layer_group.create_dataset("delays_rec", data=delays_rec, dtype="i4")
+        layer_group.create_dataset("delay_rec", data=delays_rec, dtype="i4")
     
     # Export neuron model
     _export_neuron(layer_group, pop.shape, dt, quant_scale,
