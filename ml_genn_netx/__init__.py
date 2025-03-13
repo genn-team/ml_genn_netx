@@ -159,6 +159,7 @@ def _get_netx_delays(delay: InitValue, num_src: int, num_trg: int):
     is_delay_array = is_value_array(delay)
     if is_delay_const and delay == 0:
         return None
+
     # Otherwise, if it's constant or an array
     elif is_delay_array or is_delay_const:
         # Reshape arrays
@@ -167,8 +168,11 @@ def _get_netx_delays(delay: InitValue, num_src: int, num_trg: int):
         
         # Take transpose and convert to integer
         delay = np.rint(np.transpose(delay)).astype(int)
-        if np.any((delay < 0) | (delay >= 62)):
+
+        # Check delays are in range and clip
+        if np.any((delay < 0) | (delay > 62)):
             logger.warn("\tFor Loihi delays must be between 0 and 62")
+        delay = np.clip(delay, 0, 62)
         return delay
     else:
         raise RuntimeError("Before exporting to NetX, delays "
