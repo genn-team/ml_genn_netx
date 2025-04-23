@@ -9,6 +9,7 @@ from ml_genn import Network, Population
 from ml_genn.connectivity import Dense
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, Neuron
 from ml_genn.synapses import Delta, Exponential, Synapse
+from ml_genn.utils.value import InitValue
 
 from ml_genn.utils.network import get_underlying_pop
 from ml_genn.utils.value import is_value_array, is_value_constant
@@ -138,7 +139,7 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
     # **NOTE** weight scale may be a scalar or num_trg long vector
     weights = [(np.reshape(w, (s, t)) * weight_scale, s, t)
                 for w, s, t in weights]
-    
+
     # Flatten and concatenate weights and find scaling factors
     weights_concat = np.concatenate([w.flatten() for w, _, _ in weights])
     min_quant, max_quant, scale = _find_signed_scale(weights_concat, num_bits,
@@ -152,6 +153,31 @@ def _get_netx_weight(weights: Sequence[Tuple[np.ndarray, int, int]],
     
     return scale, *quant_weights
 
+def _get_netx_delays(delay: InitValue, num_src: int, num_trg: int):
+    # If delay is constant and zero, do nothing
+    is_delay_const = is_value_constant(delay)
+    is_delay_array = is_value_array(delay)
+    if is_delay_const and delay == 0:
+        return None
+
+    # Otherwise, if it's constant or an array
+    elif is_delay_array or is_delay_const:
+        # Reshape arrays
+        if is_delay_array:
+            delay = np.reshape(delay, (num_src, num_trg))
+        
+        # Take transpose and convert to integer
+        delay = np.rint(np.transpose(delay)).astype(int)
+
+        # Check delays are in range and clip
+        if np.any((delay < 0) | (delay > 62)):
+            logger.warn("\tFor Loihi delays must be between 0 and 62")
+        delay = np.clip(delay, 0, 62)
+        return delay
+    else:
+        raise RuntimeError("Before exporting to NetX, delays "
+                           "should be loaded from checkpoints")
+    
 def _export_neuron(layer_group: h5py.Group, shape, dt: float, 
                    quant_scale: float, neuron: Neuron, synapse: Synapse):
     # Create group
@@ -273,6 +299,11 @@ def _export_feedfoward(layer_group: h5py.Group, pop: Population,
     # Create dataset
     layer_group.create_dataset("weight", data=quant_weights, dtype="f4")
     
+    # Add delays
+    delays = _get_netx_delays(con.connectivity.delay, num_src, num_trg)
+    if delays is not None:
+        layer_group.create_dataset("delay", data=delays, dtype="i4")
+    
     # Export neuron model
     _export_neuron(layer_group, pop.shape, dt, quant_scale,
                    pop.neuron, con.synapse)
@@ -334,6 +365,17 @@ def _export_recurrent(layer_group: h5py.Group, pop: Population,
     layer_group.create_dataset("weight_rec", data=quant_rec_weights,
                                dtype="f4")
 
+    
+    # Add feedforward delays
+    delays = _get_netx_delays(ff_con.connectivity.delay, num_src, num_trg)
+    if delays is not None:
+        layer_group.create_dataset("delay", data=delays, dtype="i4")
+    
+    # Add recurrent delays
+    delays_rec = _get_netx_delays(rec_con.connectivity.delay, num_trg, num_trg)
+    if delays_rec is not None:
+        layer_group.create_dataset("delay_rec", data=delays_rec, dtype="i4")
+    
     # Export neuron model
     _export_neuron(layer_group, pop.shape, dt, quant_scale,
                    pop.neuron, rec_con.synapse)

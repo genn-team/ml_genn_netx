@@ -7,4 +7,4 @@ setup(
 
     python_requires=">=3.7.0",
     install_requires = [
-        "ml_genn>=2.1.0", "h5py"])
+        "ml_genn>=2.3.0", "h5py"])
